@@ -24,7 +24,7 @@ type TrainingStats = {
   advice: string;
 };
 
-type Provider = "openai" | "anthropic";
+type Provider = "openai" | "anthropic" | "opencode";
 
 type Preset = {
   id: string;
@@ -109,6 +109,15 @@ const PRESETS: Preset[] = [
     modelWorker: "",
     hint: "vLLM / Ollama / 其他网关，填完整 base URL",
   },
+  {
+    id: "opencode",
+    label: "本地 OpenCode",
+    provider: "opencode",
+    baseUrl: "",
+    modelArchitect: "opencode/ling-3.1-flash-free",
+    modelWorker: "opencode/ling-3.1-flash-free",
+    hint: "调用本机已安装的 OpenCode CLI，用它自己的 provider 登录与配额；不需要在这里填 API key",
+  },
 ];
 
 type CurrentConfig = {
@@ -120,6 +129,8 @@ type CurrentConfig = {
   anthropicKeyMasked: string | null;
   modelArchitect: string | null;
   modelWorker: string | null;
+  opencodeModel: string | null;
+  opencodeCli: string | null;
   maxOutputTokens: string | null;
   timeoutMs: string | null;
   runVerification: boolean;
@@ -132,6 +143,11 @@ export default function SettingsPage() {
   const [apiKey, setApiKey] = useState("");
   const [modelArchitect, setModelArchitect] = useState("");
   const [modelWorker, setModelWorker] = useState("");
+  const [opencodeCli, setOpencodeCli] = useState("");
+  /** Models OpenCode can actually reach on this machine. */
+  const [opencodeModels, setOpencodeModels] = useState<string[]>([]);
+  const [opencodeModelsError, setOpencodeModelsError] = useState<string | null>(null);
+  const [loadingModels, setLoadingModels] = useState(false);
   const [maxOutputTokens, setMaxOutputTokens] = useState("16000");
   const [timeoutMs, setTimeoutMs] = useState("600000");
   const [runVerification, setRunVerification] = useState(true);
@@ -162,6 +178,7 @@ export default function SettingsPage() {
       );
       setModelArchitect(config.modelArchitect ?? "");
       setModelWorker(config.modelWorker ?? "");
+      setOpencodeCli(config.opencodeCli ?? "");
       setMaxOutputTokens(config.maxOutputTokens ?? "16000");
       setTimeoutMs(config.timeoutMs ?? "600000");
       setRunVerification(config.runVerification);
@@ -185,6 +202,12 @@ export default function SettingsPage() {
   }, [load]);
 
   const preset = PRESETS.find((p) => p.id === presetId) ?? PRESETS[0]!;
+  /**
+   * OpenCode is delegated to a local CLI that owns its own provider logins, so
+   * the base-URL/key fields do not apply to it - and showing them would invite
+   * the user to enter credentials that nothing reads.
+   */
+  const isOpencode = preset.provider === "opencode";
 
   const applyPreset = (id: string) => {
     const next = PRESETS.find((p) => p.id === id);
@@ -217,6 +240,10 @@ export default function SettingsPage() {
           apiKey: apiKey || undefined,
           modelArchitect,
           modelWorker,
+          // OpenCode manages its own credentials, so it only needs the model id
+          // and an optional CLI path.
+          opencodeModel: preset.provider === "opencode" ? modelArchitect : undefined,
+          opencodeCli: preset.provider === "opencode" ? opencodeCli : undefined,
           maxOutputTokens,
           timeoutMs,
           runVerification,
@@ -234,6 +261,35 @@ export default function SettingsPage() {
       notify("err", (e as Error).message);
     } finally {
       setSaving(false);
+    }
+  };
+
+  const loadOpencodeModels = async () => {
+    setLoadingModels(true);
+    setOpencodeModelsError(null);
+    try {
+      const response = await fetch("/api/settings/opencode-models");
+      const payload = (await response.json()) as {
+        ok: boolean;
+        models: string[];
+        error?: string;
+        current?: string;
+      };
+      if (!payload.ok) {
+        setOpencodeModelsError(payload.error ?? "无法读取 OpenCode 模型列表");
+        setOpencodeModels([]);
+        return;
+      }
+      setOpencodeModels(payload.models);
+      if (payload.models.length === 0) {
+        setOpencodeModelsError(
+          "OpenCode 没有返回任何模型。请先运行 `opencode auth login` 登录一个 provider。",
+        );
+      }
+    } catch (e) {
+      setOpencodeModelsError((e as Error).message);
+    } finally {
+      setLoadingModels(false);
     }
   };
 
@@ -330,6 +386,81 @@ export default function SettingsPage() {
 
         {/* Config form */}
         <section className="rounded-lg border border-line bg-surface p-6 shadow-card">
+          {isOpencode ? (
+            <>
+              <div className="rounded-md border border-line bg-inset px-4 py-3">
+                <p className="text-sm font-medium text-ink">本地 OpenCode</p>
+                <p className="mt-1.5 text-xs leading-relaxed text-muted">
+                  题目生成会调用本机安装的 OpenCode CLI（<code className="font-mono">opencode run</code>），
+                  使用它自己已登录的 provider 与配额，因此这里不需要填 API Key。
+                </p>
+                <p className="mt-2 text-xs leading-relaxed text-warn">
+                  注意：OpenCode 以<strong>只读</strong>方式运行在临时目录中，只负责「产出文本」；
+                  写文件、编译、造数据与修复仍由本流水线完成。
+                  每次调用它都会启动一个私有服务，约需 30–45 秒启动开销，明显慢于直连 API。
+                </p>
+              </div>
+
+              <div className="mt-6 flex flex-col gap-2">
+                <label htmlFor="opencodeCli" className="text-sm font-medium text-ink">
+                  OpenCode CLI 路径（可选）
+                </label>
+                <input
+                  id="opencodeCli"
+                  value={opencodeCli}
+                  onChange={(e) => setOpencodeCli(e.target.value)}
+                  placeholder="留空 = 自动查找（%LOCALAPPDATA%\Programs\@opencodedesktop\resources\opencode-cli.exe）"
+                  className="rounded-md border border-line-strong bg-raised px-3 py-2 font-mono text-xs text-ink placeholder:text-subtle focus-ring"
+                />
+                <p className="text-xs text-subtle">
+                  如果 OpenCode 不在默认位置或 PATH 上，填 opencode-cli.exe 的完整路径。
+                </p>
+              </div>
+
+              <div className="mt-6 flex flex-col gap-2">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <label htmlFor="opencodeModelSelect" className="text-sm font-medium text-ink">
+                    模型
+                  </label>
+                  <button
+                    type="button"
+                    onClick={loadOpencodeModels}
+                    disabled={loadingModels}
+                    className="rounded-md border border-line-strong px-2.5 py-1 text-xs font-medium text-ink transition-colors duration-300 hover:bg-inset disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {loadingModels ? "读取中…" : "读取本机可用模型"}
+                  </button>
+                </div>
+                <input
+                  id="opencodeModelSelect"
+                  value={modelArchitect}
+                  onChange={(e) => {
+                    setModelArchitect(e.target.value);
+                    setModelWorker(e.target.value);
+                  }}
+                  list="opencode-model-list"
+                  placeholder="opencode/ling-3.1-flash-free"
+                  className="rounded-md border border-line-strong bg-raised px-3 py-2 font-mono text-sm text-ink placeholder:text-subtle focus-ring"
+                />
+                <datalist id="opencode-model-list">
+                  {opencodeModels.map((m) => (
+                    <option key={m} value={m} />
+                  ))}
+                </datalist>
+                <p className="text-xs text-subtle">
+                  {opencodeModels.length > 0
+                    ? `本机可用 ${opencodeModels.length} 个模型，可从下拉中选。`
+                    : "点右侧按钮从本机 OpenCode 读取可用模型（需要已在 OpenCode 中登录 provider）。"}
+                </p>
+                {opencodeModelsError ? (
+                  <p role="alert" className="rounded-md border border-line bg-inset px-3 py-2 text-xs text-warn">
+                    {opencodeModelsError}
+                  </p>
+                ) : null}
+              </div>
+            </>
+          ) : (
+            <>
           <div className="flex flex-col gap-2">
             <label htmlFor="baseUrl" className="text-sm font-medium text-ink">
               Base URL
@@ -363,6 +494,8 @@ export default function SettingsPage() {
               只写入本地 .env.local，不会发送到任何第三方。
             </p>
           </div>
+            </>
+          )}
 
           <div className="mt-6 grid gap-6 sm:grid-cols-2">
             <div className="flex flex-col gap-2">

@@ -42,12 +42,15 @@ function requireEnv(...keys: string[]): string {
   );
 }
 
-type Provider = "openai" | "anthropic";
+type Provider = "openai" | "anthropic" | "opencode";
 
 function provider(): Provider {
   const raw = process.env.LLM_PROVIDER?.trim().toLowerCase();
   if (raw === "anthropic") {
     return "anthropic";
+  }
+  if (raw === "opencode") {
+    return "opencode";
   }
   return "openai";
 }
@@ -92,8 +95,28 @@ function splitSystem(messages: ChatMessage[]): {
   return { system: system.join("\n\n"), rest };
 }
 
-/** Combine the timeout with an externally supplied abort signal. */
-function linkedSignal(timeout: number, external?: AbortSignal): AbortSignal {
+/**
+ * Fold a chat conversation into the single prompt OpenCode accepts.
+ *
+ * OpenCode takes one message, so the roles are made explicit as headings rather
+ * than dropped: the pipeline's system prompts carry the file-block protocol and
+ * the testlib rules, and losing that framing would change the output format.
+ */
+function flattenForOpencode(messages: ChatMessage[]): string {
+  const sections: string[] = [];
+  for (const message of messages) {
+    if (message.role === "system") {
+      sections.push(`# 系统指令\n\n${message.content}`);
+    } else if (message.role === "assistant") {
+      sections.push(`# 你之前的输出\n\n${message.content}`);
+    } else {
+      sections.push(`# 任务\n\n${message.content}`);
+    }
+  }
+  return sections.join("\n\n---\n\n");
+}
+
+/** Combine the timeout with an externally supplied abort signal. */function linkedSignal(timeout: number, external?: AbortSignal): AbortSignal {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(new Error("模型请求超时")), timeout);
   const onAbort = () => controller.abort(external?.reason);
@@ -283,6 +306,19 @@ export async function complete(
     signal: options?.signal,
   };
 
+  // OpenCode replaces the whole completion call rather than one wire format: it
+  // is a local agent, so the messages are folded into the single prompt it
+  // accepts, and it runs read-only (see lib/llm/opencode.ts).
+  if (kind === "opencode") {
+    const { opencodeComplete } = await import("@/lib/llm/opencode");
+    return opencodeComplete(flattenForOpencode(messages), {
+      // Its private server costs ~30-45s of startup per call, so it gets a
+      // floor well above the HTTP backends' default.
+      timeoutMs: Math.max(resolved.timeoutMs, 600_000),
+      signal: resolved.signal,
+    });
+  }
+
   const MAX_CONTINUATIONS = 4;
   let conversation = [...messages];
   let full = "";
@@ -319,7 +355,14 @@ export async function complete(
 /** Whether credentials are present, so the UI can show setup guidance. */
 export function llmConfigured(): boolean {
   try {
-    if (provider() === "anthropic") {
+    const kind = provider();
+    if (kind === "opencode") {
+      // OpenCode holds its own credentials, so there is no key to check here.
+      // A missing CLI or an unauthenticated provider surfaces on the first call
+      // with a specific message, which is more useful than blocking generation.
+      return true;
+    }
+    if (kind === "anthropic") {
       return Boolean(process.env.ANTHROPIC_API_KEY?.trim());
     }
     return Boolean(

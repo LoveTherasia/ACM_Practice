@@ -38,6 +38,8 @@ export async function GET() {
     anthropicKeyMasked: mask(values.ANTHROPIC_API_KEY),
     modelArchitect: values.LLM_MODEL_ARCHITECT?.trim() || null,
     modelWorker: values.LLM_MODEL_WORKER?.trim() || null,
+    opencodeModel: values.OPENCODE_MODEL?.trim() || null,
+    opencodeCli: values.OPENCODE_CLI?.trim() || null,
     maxOutputTokens: values.LLM_MAX_OUTPUT_TOKENS?.trim() || null,
     timeoutMs: values.LLM_TIMEOUT_MS?.trim() || null,
     runVerification: values.RUN_VERIFICATION?.trim() !== "0",
@@ -45,11 +47,16 @@ export async function GET() {
 }
 
 const saveSchema = z.object({
-  provider: z.enum(["openai", "anthropic"]),
+  /** "opencode" delegates to the locally installed OpenCode CLI. */
+  provider: z.enum(["openai", "anthropic", "opencode"]),
   baseUrl: z.string().max(500).optional(),
   apiKey: z.string().max(500).optional(),
   modelArchitect: z.string().max(200).optional(),
   modelWorker: z.string().max(200).optional(),
+  /** OpenCode's own model id, e.g. "opencode/ling-3.1-flash-free". */
+  opencodeModel: z.string().max(200).optional(),
+  /** Full path to opencode-cli.exe when it is not in the default location. */
+  opencodeCli: z.string().max(500).optional(),
   maxOutputTokens: z.string().max(10).optional(),
   timeoutMs: z.string().max(10).optional(),
   runVerification: z.boolean().optional(),
@@ -86,7 +93,17 @@ export async function POST(request: Request) {
 
   const next: Record<string, string> = {};
 
-  if (input.provider === "anthropic") {
+  if (input.provider === "opencode") {
+    // OpenCode owns its own credentials and provider logins, so no key or base
+    // URL is written here - only which CLI to run and which model to ask for.
+    next.LLM_PROVIDER = "opencode";
+    if (input.opencodeModel?.trim()) {
+      next.OPENCODE_MODEL = input.opencodeModel.trim();
+    }
+    if (input.opencodeCli?.trim()) {
+      next.OPENCODE_CLI = input.opencodeCli.trim();
+    }
+  } else if (input.provider === "anthropic") {
     next.LLM_PROVIDER = "anthropic";
     if (input.baseUrl?.trim()) {
       next.ANTHROPIC_BASE_URL = input.baseUrl.trim();
