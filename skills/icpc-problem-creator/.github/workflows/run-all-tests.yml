@@ -1,0 +1,21 @@
+name: run-all-tests
+
+on:
+  push:
+    paths-ignore:
+      - '**/*.md'
+  pull_request:
+    paths-ignore:
+      - '**/*.md'
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: run all tests
+        shell: pwsh
+        run: ./scripts/run-all-tests.ps1
+

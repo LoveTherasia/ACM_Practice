@@ -1,0 +1,11 @@
+import torch
+
+print("torch:", torch.__version__)
+print("cuda available:", torch.cuda.is_available())
+if torch.cuda.is_available():
+    print("gpu:", torch.cuda.get_device_name(0))
+    print("bf16:", torch.cuda.is_bf16_supported())
+    total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+    print(f"vram: {total:.1f} GB")
+else:
+    print("ERROR: GPU not visible to PyTorch")

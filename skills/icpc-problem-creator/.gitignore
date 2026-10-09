@@ -1,0 +1,20 @@
+# executable and temp files
+.codex*
+tmp
+*.exe
+__pycache__
+
+# exported file
+*.zip
+exports/**
+
+# ignore all generated files except the examples
+examples/**
+!examples/a-plus-b
+!examples/a-plus-b/**
+!examples/compile-by-command
+!examples/compile-by-command/**
+!examples/magic-and-crab
+!examples/magic-and-crab/**
+!examples/mt-louguan-mine-sweeping
+!examples/mt-louguan-mine-sweeping/**

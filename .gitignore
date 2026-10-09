@@ -1,0 +1,66 @@
+# dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# next.js
+.next/
+out/
+next-env.d.ts
+
+# production
+build/
+dist/
+
+# environment
+.env
+.env.local
+.env*.local
+
+# problem workspaces produced by the pipeline
+#
+# The whole problems/ tree stays local. These are generated artefacts: each one
+# carries a 213 KB vendored testlib.h, and the workspace is what the pipeline
+# produces rather than what the project is. Re-generate them instead of
+# versioning them, so the repository stays small and contains only source.
+#
+# The category index.json files live inside that tree and are ignored with it;
+# the registry rebuilds them (allocateProblem/recordProblem) on the next run.
+problems/
+
+# leftovers of that tree, in case it is re-included selectively later
+problems/**/testdata/
+problems/**/.testdata/
+problems/**/exported-tests/
+.codex-test-artifacts/
+
+# local-model training artifacts (the dataset itself IS tracked)
+training/adapter/
+training/merged/
+training/.venv/
+
+# unsloth compiled-kernel cache (written to the CWD of training runs)
+unsloth_compiled_cache/
+
+# launcher diagnostics
+launcher-debug.log
+.devlog.txt
+.train.log
+
+# verification transcripts (moved to repo root for easy access)
+verify-logs/
+
+# logs
+*.log
+npm-debug.log*
+logs/
+
+# editors / os
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+
+# typescript
+*.tsbuildinfo

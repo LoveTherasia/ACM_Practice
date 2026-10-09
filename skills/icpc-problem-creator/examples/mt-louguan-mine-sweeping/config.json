@@ -1,0 +1,113 @@
+{
+  "slug": "mt-louguan-mine-sweeping",
+  "title": "娄山关扫雷",
+  "interactive": false,
+  "timeLimitMs": 1000,
+  "memoryLimitMb": 256,
+  "standard": "gnu++20",
+  "statement": "docs/statement.md",
+  "tutorial": "docs/tutorial.md",
+  "validator": "src/validator/validator.cpp",
+  "generator": {
+    "path": "src/generator/generator.cpp",
+    "cases": [
+      { "name": "sample-1", "type": "sample", "seed": 1, "group": "sample", "checkWith": ["solution2", "python"] },
+      { "name": "zero-1", "type": "zero", "seed": 2, "group": "secret", "checkWith": ["solution2", "python"] },
+      { "name": "full-1", "type": "full", "seed": 3, "group": "secret", "checkWith": ["solution2", "python"] },
+      { "name": "tiny-hack-1", "type": "tiny-hack", "seed": 4, "group": "secret", "checkWith": ["solution2", "python"] },
+      { "name": "square-hack-1", "type": "square-hack", "seed": 5, "group": "secret", "checkWith": ["solution2", "python"] },
+      { "name": "near-full-small-1", "type": "near-full-small", "seed": 6, "group": "secret", "checkWith": ["solution2", "python"] },
+      { "name": "random-small-1", "type": "random-small", "seed": 7, "group": "secret", "checkWith": ["solution2", "python"] },
+      { "name": "random-small-2", "type": "random-small", "seed": 8, "group": "secret", "checkWith": ["solution2", "python"] },
+      { "name": "random-small-3", "type": "random-small", "seed": 9, "group": "secret" },
+      { "name": "random-small-4", "type": "random-small", "seed": 10, "group": "secret" },
+      { "name": "random-small-5", "type": "random-small", "seed": 11, "group": "secret" },
+      { "name": "random-medium-1", "type": "random-medium", "seed": 12, "group": "secret" },
+      { "name": "random-medium-2", "type": "random-medium", "seed": 13, "group": "secret" },
+      { "name": "random-medium-3", "type": "random-medium", "seed": 14, "group": "secret" },
+      { "name": "random-medium-4", "type": "random-medium", "seed": 15, "group": "secret" },
+      { "name": "random-medium-5", "type": "random-medium", "seed": 16, "group": "secret" },
+      { "name": "random-medium-6", "type": "random-medium", "seed": 17, "group": "secret" },
+      { "name": "random-large-1", "type": "random-large", "seed": 18, "group": "secret" },
+      { "name": "random-large-2", "type": "random-large", "seed": 19, "group": "secret" },
+      { "name": "random-large-3", "type": "random-large", "seed": 20, "group": "secret" },
+      { "name": "random-large-4", "type": "random-large", "seed": 21, "group": "secret" },
+      { "name": "random-large-5", "type": "random-large", "seed": 22, "group": "secret" },
+      { "name": "random-large-6", "type": "random-large", "seed": 23, "group": "secret" },
+      { "name": "random-large-7", "type": "random-large", "seed": 24, "group": "secret" },
+      { "name": "random-large-8", "type": "random-large", "seed": 25, "group": "secret" },
+      { "name": "balanced-large-1", "type": "balanced-large", "seed": 26, "group": "secret" },
+      { "name": "balanced-large-2", "type": "balanced-large", "seed": 27, "group": "secret" },
+      { "name": "balanced-large-3", "type": "balanced-large", "seed": 28, "group": "secret" },
+      { "name": "balanced-large-4", "type": "balanced-large", "seed": 29, "group": "secret" },
+      { "name": "near-full-large-1", "type": "near-full-large", "seed": 30, "group": "secret" },
+      { "name": "near-full-large-2", "type": "near-full-large", "seed": 31, "group": "secret" },
+      { "name": "near-full-large-3", "type": "near-full-large", "seed": 32, "group": "secret" },
+      { "name": "low-k-large-1", "type": "low-k-large", "seed": 33, "group": "secret" },
+      { "name": "low-k-large-2", "type": "low-k-large", "seed": 34, "group": "secret" },
+      { "name": "low-k-large-3", "type": "low-k-large", "seed": 35, "group": "secret" }
+    ]
+  },
+  "checker": "src/checker/checker.cpp",
+  "build": {
+    "cppCompiler": "g++",
+    "cppFlags": ["-std={{standard}}", "-O2", "-pipe"],
+    "pythonCommand": "python"
+  },
+  "solutions": [
+    {
+      "name": "main",
+      "path": "src/solution.cpp",
+      "language": "cpp",
+      "role": "main"
+    },
+    {
+      "name": "solution2",
+      "path": "src/solution2.cpp",
+      "language": "cpp",
+      "role": "reference"
+    },
+    {
+      "name": "python",
+      "path": "src/solution.py",
+      "language": "python",
+      "role": "reference",
+      "cases": [
+        "sample-1",
+        "zero-1",
+        "full-1",
+        "tiny-hack-1",
+        "square-hack-1",
+        "near-full-small-1",
+        "random-small-1",
+        "random-small-2"
+      ]
+    }
+  ],
+  "wrongSolutions": [
+    {
+      "name": "wrong-square-only",
+      "path": "src/wrong/wrong-a.cpp",
+      "language": "cpp",
+      "expected": "fail"
+    },
+    {
+      "name": "wrong-full-row-greedy",
+      "path": "src/wrong/wrong-b.cpp",
+      "language": "cpp",
+      "expected": "fail"
+    },
+    {
+      "name": "wrong-diagonal-count",
+      "path": "src/wrong/wrong-c.cpp",
+      "language": "cpp",
+      "expected": "fail"
+    },
+    {
+      "name": "wrong-rect-greedy",
+      "path": "src/wrong/wrong-d.cpp",
+      "language": "cpp",
+      "expected": "fail"
+    }
+  ]
+}
