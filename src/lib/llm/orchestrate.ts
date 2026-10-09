@@ -23,7 +23,7 @@ import {
   type ProblemConfig,
   type ProblemMeta,
 } from "@/lib/problems/schema";
-import { patchMeta, writeMeta } from "@/lib/problems/store";
+import { patchMeta, readProblem, writeMeta } from "@/lib/problems/store";
 import { allocateProblem, recordProblem } from "@/lib/problems/category";
 import { captureSample } from "@/lib/training/dataset";
 import {
@@ -1298,6 +1298,42 @@ export async function runPipeline(
               ]
             : [];
 
+        // The format contract the architect fixed at the start. It is passed to
+        // the workers, but the repair prompt used to omit it - and that is how
+        // dp-009 drifted: the repair loop rewrote validator, generator and both
+        // solutions into a self-consistent "sum n integers" problem while the
+        // statement still described an MST, and verification passed because
+        // data and solutions agreed with each other. Repairing a format defect
+        // without the contract is guesswork, so the contract travels with every
+        // repair round.
+        let contractSection: string[] = [];
+        try {
+          const detail = await readProblem(problemId);
+          const inputFormat = detail?.meta.inputFormat?.trim();
+          const outputFormat = detail?.meta.outputFormat?.trim();
+          if (inputFormat || outputFormat) {
+            contractSection = [
+              "",
+              "## 题面声明的格式契约（**修改输入/输出相关代码时必须以它为准**）",
+              "",
+              ...(inputFormat ? [`- 输入格式：${inputFormat}`] : []),
+              ...(outputFormat ? [`- 输出格式：${outputFormat}`] : []),
+              "",
+              "题目在生成过程中出现过这一类严重问题：validator、generator 与两份标程",
+              "互相一致地实现了**错误的输入格式**，于是本地验题全部通过，",
+              "但题面描述的完全是另一道题（验题脚本从不读题面，所以查不出来）。",
+              "因此每次改动输入/输出相关代码时，请对照上面的契约逐项确认：",
+              "- 行数一致：契约说几行，generator 就输出几行、validator 就读几行",
+              "- 每行字段数一致：契约说第一行几个数，validator 就在同一行读几个数",
+              "- 类型一致：契约说字符串/YES-NO 就用 readToken，说整数就用 readInt/readLong",
+              "**如果契约与代码冲突，以题面契约（或 docs/statement.md）为准改代码**，",
+              "不要为了让验题通过而改契约去迁就代码。",
+            ];
+          }
+        } catch {
+          // No contract available: the repair still proceeds on the digest.
+        }
+
         // Extract file paths mentioned in the failures and inline them.
         const mentionedFiles = new Set<string>();
         for (const failure of verification.failures.slice(0, 10)) {
@@ -1340,6 +1376,7 @@ export async function runPipeline(
                   "",
                   digest,
                   ...compileSection,
+                  ...contractSection,
                   ...(attempts.length > 0
                     ? [
                         "",

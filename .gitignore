@@ -19,19 +19,15 @@ dist/
 
 # problem workspaces produced by the pipeline
 #
-# The whole problems/ tree stays local. These are generated artefacts: each one
-# carries a 213 KB vendored testlib.h, and the workspace is what the pipeline
-# produces rather than what the project is. Re-generate them instead of
-# versioning them, so the repository stays small and contains only source.
-#
-# The category index.json files live inside that tree and are ignored with it;
-# the registry rebuilds them (allocateProblem/recordProblem) on the next run.
-problems/
+# The leading slash anchors this to the repo root. Without it, the pattern also
+# matches src/lib/problems/ - the application's own source directory - which
+# silently excluded new files there (format.ts was the first casualty).
+/problems/
 
 # leftovers of that tree, in case it is re-included selectively later
-problems/**/testdata/
-problems/**/.testdata/
-problems/**/exported-tests/
+/problems/**/testdata/
+/problems/**/.testdata/
+/problems/**/exported-tests/
 .codex-test-artifacts/
 
 # local-model training artifacts (the dataset itself IS tracked)
