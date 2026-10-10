@@ -328,7 +328,9 @@ ${brief.title ? `- 指定标题：${brief.title}\n` : ""}- 难度定位：${brie
 
 ${constraints}
 
-先在心里确定架构，再一次性输出 config.json、docs/statement.md、meta.json 三个文件。
+先在心里确定架构，再一次性写出 config.json、docs/statement.md、meta.json 三个文件。
+**这三个文件一个都不能少**：config.json 可能已存在模板内容，必须用你规划的真实内容**完整重写**；
+meta.json 当前不存在，必须**新建**。
 config.json 里的 generator.cases 与 wrongSolutions 要和题面、题解计划自洽：
 每个错解都要有能卡住它的定向 case，不要写"卡不住任何数据"的错解。
 `.trim();

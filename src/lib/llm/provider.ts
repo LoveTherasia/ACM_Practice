@@ -282,6 +282,50 @@ async function completeAnthropic(
   return { text, finishReason: null };
 }
 
+export type WorkspaceResult = {
+  reply: string;
+  /** Files the agent created or edited, relative to the workspace, forward slashes. */
+  writtenFiles: string[];
+  /**
+   * Why the agent stopped. "quiet" is the fast path: the workspace stopped
+   * changing so the agent was stopped early rather than waiting out its
+   * timeout. "deadline" means the timeout was reached; "salvaged" then says
+   * whether the files it had already written were kept.
+   */
+  stopReason?: "exited" | "quiet" | "deadline";
+  salvaged?: boolean;
+};
+
+/**
+ * File-direct completion: the agent works inside `workspaceDir` and writes
+ * files there itself. Only meaningful for the OpenCode backend; the HTTP
+ * backends have no file access, so they fall back to the text protocol and
+ * the caller must parse file blocks from the reply.
+ */
+export async function completeInWorkspace(
+  messages: ChatMessage[],
+  workspaceDir: string,
+  options?: Partial<ChatOptions>,
+): Promise<WorkspaceResult> {
+  const kind = provider();
+  if (kind !== "opencode") {
+    const reply = await complete(messages, options);
+    return { reply, writtenFiles: [] };
+  }
+  const resolved: ChatOptions = {
+    model: options?.model ?? workerModel(),
+    maxTokens: options?.maxTokens ?? maxTokens(),
+    timeoutMs: options?.timeoutMs ?? timeoutMs(),
+    signal: options?.signal,
+  };
+  const { opencodeWorkspaceComplete } = await import("@/lib/llm/opencode");
+  return opencodeWorkspaceComplete(flattenForOpencode(messages), {
+    workspaceDir,
+    timeoutMs: Math.max(resolved.timeoutMs, 600_000),
+    signal: resolved.signal,
+  });
+}
+
 /**
  * One chat completion, transparently continued across max_tokens cuts.
  *

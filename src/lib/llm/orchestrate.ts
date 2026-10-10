@@ -1,6 +1,12 @@
 import { promises as fs } from "node:fs";
 
-import { architectModel, complete, LlmError, workerModel } from "@/lib/llm/provider";
+import {
+  architectModel,
+  complete,
+  completeInWorkspace,
+  LlmError,
+  workerModel,
+} from "@/lib/llm/provider";
 import {
   architectSystem,
   architectUser,
@@ -308,6 +314,96 @@ export function summarizeFailures(
 
 function newRunId(): string {
   return `run-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/**
+ * Whether the backend writes files directly (OpenCode in workspace mode).
+ *
+ * In this mode the roles do not speak the `<<<FILE ...>>>` protocol: the agent
+ * works inside the problem workspace and creates/edits files itself. The
+ * pipeline still owns scheduling, config merging and verification - those all
+ * run after the agent is done, so the safety checks stay meaningful.
+ */
+function fileDirectMode(): boolean {
+  return process.env.LLM_PROVIDER?.trim().toLowerCase() === "opencode";
+}
+
+/**
+ * Extra instructions for file-direct mode, appended to the system prompt.
+ *
+ * The role specs describe the `<<<FILE ...>>>` output protocol because that is
+ * what the HTTP backends use. In file-direct mode that protocol is wrong: the
+ * agent writes files itself. This block tells it so, and restates the rules
+ * that still matter (which files it owns, completeness, no placeholders).
+ */
+const FILE_DIRECT_ADDENDUM = `
+## 本模式的工作方式（覆盖上面的"输出格式"章节）
+
+你**不需要**输出 <<<FILE ...>>> 文件块。请直接在当前工作目录里新建和修改文件：
+
+- 先读取当前目录下的 .task-spec.md——那是你的完整任务说明，本消息只是引导。
+- 用你的文件工具把每个文件写到磁盘上，路径相对于当前工作目录。
+- 工作区里已存在的模板文件（config.json、docs/statement.md 等）必须用你规划的真实内容**完整重写**。
+- 任务说明里列出的每一个文件都必须产出，一个都不能少。
+- 文件内容必须完整，禁止 TODO、占位文本、"..."、空实现。
+- 只写分配给你的文件，不要动其它角色的文件。
+- 完成后只回复一行：DONE
+`.trim();
+
+/**
+ * Run one role's completion in the mode the backend prefers.
+ *
+ * File-direct mode: the agent works inside the problem workspace itself and
+ * writes files there; the return value lists what it wrote (paths relative to
+ * the workspace). Text mode: the reply is parsed for file blocks by the
+ * caller, exactly as before.
+ */
+async function completeRole(
+  messages: { role: "system" | "user" | "assistant"; content: string }[],
+  problemId: string,
+  options: { model: string },
+  onNote?: (message: string) => void,
+): Promise<{ reply: string; wrote: string[] }> {
+  if (!fileDirectMode()) {
+    const reply = await complete(messages, options);
+    return { reply, wrote: [] };
+  }
+  const dir = problemDir(problemId);
+  const adjusted = messages.map((m) =>
+    m.role === "system"
+      ? { role: m.role, content: `${m.content}\n\n${FILE_DIRECT_ADDENDUM}` }
+      : m,
+  );
+  const result = await completeInWorkspace(adjusted, dir, options);
+  // Normalize: the agent may write outside the workspace or touch dotfiles;
+  // keep only paths that stay inside and look like problem artefacts.
+  const wrote = result.writtenFiles.filter(
+    (p) =>
+      !p.startsWith(".") &&
+      !p.includes("..") &&
+      (p.startsWith("src/") ||
+        p.startsWith("docs/") ||
+        p.endsWith(".json") ||
+        p.endsWith(".md")),
+  );
+
+  // Report how the agent stopped. Without this, an early stop and a timeout are
+  // indistinguishable in the log, and the difference matters: one means "the
+  // agent finished writing and was stopped", the other "we ran out of time and
+  // kept what it had".
+  if (result.stopReason === "quiet") {
+    onNote?.(
+      `agent 已停止写文件（静默 ${Math.round(
+        (Number.parseInt(process.env.OPENCODE_QUIET_MS?.trim() || "25000", 10)) / 1000,
+      )}s），提前结束，写出 ${wrote.length} 个文件`,
+    );
+  } else if (result.salvaged) {
+    onNote?.(
+      `agent 到达时限仍被强制结束，但保留它已写出的 ${wrote.length} 个文件`,
+    );
+  }
+
+  return { reply: result.reply, wrote };
 }
 
 function stage(
@@ -727,11 +823,12 @@ export async function runPipeline(
     await createWorkspace(problemId, brief.interactive);
     log("architect", `已创建工作区 problems/${problemId}`);
 
-    const reply = await complete(
+    const { reply, wrote: architectWrote } = await completeRole(
       [
         { role: "system", content: architectSystem() },
         { role: "user", content: architectUser(brief) },
       ],
+      problemId,
       { model: architectModel() },
     );
     captured.push({
@@ -741,21 +838,41 @@ export async function runPipeline(
       assistant: reply,
     });
 
-    const blocks = parseFileBlocks(reply).map(stripFencesFor);
-    const wanted = new Set(["config.json", "docs/statement.md", "meta.json"]);
-    const payload = blocks.filter((b) => wanted.has(b.path));
-    const missing = [...wanted].filter(
-      (p) => !payload.some((b) => b.path === p),
-    );
-    if (missing.length > 0) {
-      throw new Error(`architect 未产出必需文件: ${missing.join(", ")}`);
-    }
-
-    const { failed } = await writeGeneratedFiles(problemId, payload);
-    if (failed.length > 0) {
-      throw new Error(
-        `architect 文件写入失败: ${failed.map((f) => `${f.path} (${f.error})`).join("; ")}`,
+    let payload: GeneratedFile[];
+    if (fileDirectMode()) {
+      // The agent wrote files directly; read back the ones it owns.
+      const wanted = ["config.json", "docs/statement.md", "meta.json"];
+      payload = [];
+      for (const rel of wanted) {
+        const content = await readIfPresent(problemId, rel);
+        if (content) {
+          payload.push({ path: rel, content });
+        }
+      }
+      const missing = wanted.filter(
+        (p) => !payload.some((b) => b.path === p),
       );
+      if (missing.length > 0) {
+        throw new Error(`architect 未产出必需文件: ${missing.join(", ")}`);
+      }
+      log("architect", `OpenCode 直写模式：已写入 ${architectWrote.join("、")}`);
+    } else {
+      const blocks = parseFileBlocks(reply).map(stripFencesFor);
+      const wanted = new Set(["config.json", "docs/statement.md", "meta.json"]);
+      payload = blocks.filter((b) => wanted.has(b.path));
+      const missing = [...wanted].filter(
+        (p) => !payload.some((b) => b.path === p),
+      );
+      if (missing.length > 0) {
+        throw new Error(`architect 未产出必需文件: ${missing.join(", ")}`);
+      }
+
+      const { failed } = await writeGeneratedFiles(problemId, payload);
+      if (failed.length > 0) {
+        throw new Error(
+          `architect 文件写入失败: ${failed.map((f) => `${f.path} (${f.error})`).join("; ")}`,
+        );
+      }
     }
 
     const config = await readConfig(problemId);
@@ -887,14 +1004,16 @@ export async function runPipeline(
           `${approach}\n\n${dataRanges}\n\n--- 主 agent 规划的 case 清单（必须逐个实现，type 名一个都不能改）---\n${casePlan}\n\n--- 题面 ---\n${truncate(statement, 12000)}`,
           spec.targets,
         );
-        const reply = await complete(
+        const outcome = await completeRole(
           [
             { role: "system", content: system },
             { role: "user", content: user },
           ],
+          problemId,
           { model: spec.model },
+          (note) => log(spec.role, note),
         );
-        return { spec, system, user, reply };
+        return { spec, system, user, reply: outcome.reply, wrote: outcome.wrote };
       }),
     );
 
@@ -936,22 +1055,48 @@ export async function runPipeline(
       // when the target said "src/wrong/", or slightly different names, and
       // the file was silently dropped - leaving the scaffold template in
       // place and the verifier failing on "Unknown case type".
-      const allBlocks = parseFileBlocks(outcome.value.reply).map(stripFencesFor);
-      const blocks = allBlocks.filter(
-        (b: GeneratedFile) =>
-          b.path.endsWith(".json") ||
-          b.path.startsWith("src/") ||
-          b.path.startsWith("docs/"),
-      );
-      const dropped = allBlocks.filter((b: GeneratedFile) => !blocks.includes(b));
-      for (const drop of dropped) {
-        log(role, `忽略目标外的文件块：${drop.path}`);
+      let blocks: GeneratedFile[];
+      let directWrote: string[] = [];
+      if (fileDirectMode()) {
+        // The agent wrote files directly into the workspace; read back the
+        // ones it may own so downstream config merging still sees them.
+        directWrote = outcome.value.wrote;
+        blocks = [];
+        for (const rel of directWrote) {
+          if (
+            rel.endsWith(".json") ||
+            rel.startsWith("src/") ||
+            rel.startsWith("docs/")
+          ) {
+            const content = await readIfPresent(problemId, rel);
+            if (content) {
+              blocks.push({ path: rel, content });
+            }
+          }
+        }
+        if (directWrote.length > 0) {
+          log(role, `OpenCode 直写模式：已写入 ${directWrote.join("、")}`);
+        }
+      } else {
+        const allBlocks = parseFileBlocks(outcome.value.reply).map(stripFencesFor);
+        blocks = allBlocks.filter(
+          (b: GeneratedFile) =>
+            b.path.endsWith(".json") ||
+            b.path.startsWith("src/") ||
+            b.path.startsWith("docs/"),
+        );
+        const dropped = allBlocks.filter((b: GeneratedFile) => !blocks.includes(b));
+        for (const drop of dropped) {
+          log(role, `忽略目标外的文件块：${drop.path}`);
+        }
       }
       const patch = extractPatch(blocks, "config.patch.json");
       const writes = blocks.filter((b: GeneratedFile) => b.path !== "config.patch.json");
-      const result = await writeGeneratedFiles(problemId, writes);
+      const result = fileDirectMode()
+        ? { written: directWrote, failed: [] as { path: string; error: string }[] }
+        : await writeGeneratedFiles(problemId, writes);
 
-      if (writes.length === 0 && !patch) {
+      if (writes.length === 0 && !patch && directWrote.length === 0) {
         // Diagnose protocol violations: show what the reply actually began
         // with so the failure is actionable instead of a silent zero.
         const preview = outcome.value.reply
@@ -959,8 +1104,7 @@ export async function runPipeline(
           .slice(0, 300);
         log(
           role,
-          `警告：没有写出任何文件。模型回复包含 ${allBlocks.length} 个文件块，` +
-            `回复开头：${preview}`,
+          `警告：没有写出任何文件。回复开头：${preview}`,
         );
       }
 
@@ -1020,7 +1164,7 @@ export async function runPipeline(
       const statementNow = await readIfPresent(problemId, merged.statement);
       const tutorial = await readIfPresent(problemId, merged.tutorial);
 
-      const reply = await complete(
+      const { reply: integratorReply } = await completeRole(
         [
           { role: "system", content: integratorSystem() },
           {
@@ -1046,12 +1190,20 @@ export async function runPipeline(
             ].join("\n"),
           },
         ],
+        problemId,
         { model: architectModel() },
+        (note) => log("integrator", note),
       );
+      const reply = integratorReply;
 
-      if (/NO_CHANGES_REQUIRED/.test(reply)) {
+      if (/NO_CHANGES_REQUIRED/.test(reply) || /^DONE/m.test(reply.trim())) {
         advance("integrator", "done", {
           summary: "未发现需要修复的问题",
+        });
+      } else if (fileDirectMode()) {
+        // The agent edited files in place; nothing to parse or write here.
+        advance("integrator", "done", {
+          summary: "已在工作区直接完成修正",
         });
       } else {
         const blocks = parseFileBlocks(reply)
@@ -1366,7 +1518,7 @@ export async function runPipeline(
         );
 
         try {
-          const repairReply = await complete(
+          const repairOutcome = await completeRole(
             [
               { role: "system", content: integratorSystem() },
               {
@@ -1407,7 +1559,7 @@ export async function runPipeline(
                   "## 任务",
                   "",
                   "上面的失败来自刚生成的题目工作区。请定位根因并修复对应的源文件",
-                  "（**只允许输出 src/ 下的 .cpp 文件，不要输出 config.json**）。常见根因：",
+                  "（**只允许修改 src/ 下的 .cpp 文件，不要改 config.json**）。常见根因：",
                   "- 编译错误：修复对应 .cpp 文件中的语法/未声明变量等问题。",
                   "- Unknown case type：generator 缺少该 type 的分支，补上。",
                   "- 数值范围违规：generator 生成的值超出题面范围，修正生成逻辑。",
@@ -1426,31 +1578,51 @@ export async function runPipeline(
                   "- 修完请在心里把报错行重新读一遍，确认该名字不再被遮蔽。",
                   "",
                   "只修复失败信息指向的问题，不要重写无关文件。",
-                  "修复后按输出格式输出完整的修改文件（仅 src/ 下的源文件）。",
+                  fileDirectMode()
+                    ? "直接在工作区里修改对应的源文件（仅 src/ 下的 .cpp）。"
+                    : "修复后按输出格式输出完整的修改文件（仅 src/ 下的源文件）。",
                 ].join("\n"),
               },
             ],
+            problemId,
             { model: architectModel() },
           );
+          const repairReply = repairOutcome.reply;
 
           if (!/NO_CHANGES_REQUIRED/.test(repairReply)) {
-            const blocks = parseFileBlocks(repairReply).map(stripFencesFor);
-            // The repair round only rewrites source files. config.json is
-            // already valid at this point (it passed readConfig), and a
-            // model-rewritten config reintroduces shape drift that breaks
-            // validation - the exact failure mode this loop exists to fix.
-            // Case-plan problems are fixed in generator.cpp instead.
-            const writes = blocks.filter(
-              (b: GeneratedFile) =>
-                b.path.startsWith("src/") && !b.path.endsWith(".json"),
-            );
-            const skipped = blocks.filter(
-              (b: GeneratedFile) => !writes.includes(b),
-            );
-            for (const skip of skipped) {
-              log("verifier", `修复轮忽略非源文件：${skip.path}`);
+            let writes: GeneratedFile[];
+            let wrote: string[];
+            if (fileDirectMode()) {
+              // The agent edited source files in place; record what it touched.
+              wrote = repairOutcome.wrote.filter(
+                (p) => p.startsWith("src/") && !p.endsWith(".json"),
+              );
+              writes = [];
+              for (const skip of repairOutcome.wrote.filter((p) => !wrote.includes(p))) {
+                log("verifier", `修复轮忽略非源文件：${skip}`);
+              }
+            } else {
+              const blocks = parseFileBlocks(repairReply).map(stripFencesFor);
+              // The repair round only rewrites source files. config.json is
+              // already valid at this point (it passed readConfig), and a
+              // model-rewritten config reintroduces shape drift that breaks
+              // validation - the exact failure mode this loop exists to fix.
+              // Case-plan problems are fixed in generator.cpp instead.
+              writes = blocks.filter(
+                (b: GeneratedFile) =>
+                  b.path.startsWith("src/") && !b.path.endsWith(".json"),
+              );
+              const skipped = blocks.filter(
+                (b: GeneratedFile) => !writes.includes(b),
+              );
+              for (const skip of skipped) {
+                log("verifier", `修复轮忽略非源文件：${skip.path}`);
+              }
+              wrote = [];
             }
-            const result = await writeGeneratedFiles(problemId, writes);
+            const result = fileDirectMode()
+              ? { written: wrote, failed: [] as { path: string; error: string }[] }
+              : await writeGeneratedFiles(problemId, writes);
             for (const failure of result.failed) {
               log("verifier", `修复轮写入失败 ${failure.path}：${failure.error}`);
             }
