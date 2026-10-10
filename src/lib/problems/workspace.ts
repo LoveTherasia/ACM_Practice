@@ -7,6 +7,7 @@ import { icpcSkillDir, problemDir, problemPath } from "@/lib/paths";
 import { auditCoverage, formatCoverageForLog } from "@/lib/problems/coverage";
 import {
   checkDeclaredFormat,
+  checkWrongSolutionSubstance,
   describeFormatMismatch,
 } from "@/lib/problems/format";
 import {
@@ -806,6 +807,12 @@ export async function preflightCompile(
   if (mismatch) {
     problems.push(describeFormatMismatch(mismatch));
   }
+
+  // A "wrong" solution that never reads the input is a placeholder, not a probe:
+  // it fails on every input, so it cannot show the data defeats any mistake.
+  problems.push(
+    ...(await checkWrongSolutionSubstance(problemId, config).catch(() => [])),
+  );
 
   for (const relative of preflightTargets(config)) {
     const absolute = problemPath(problemId, relative);

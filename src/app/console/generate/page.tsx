@@ -194,10 +194,13 @@ export default function GeneratePage() {
         tags: string[];
       };
       setPremise(idea.premise);
-      if (idea.tags.length > 0) {
-        setTags(idea.tags.join(", "));
-      }
-      setIdeaNotice(`已生成 idea「${idea.title}」，已填入下方，可自行修改。`);
+      // Tags stay untouched: the user's own direction (if any) is the input,
+      // and the idea's suggested tags are shown in the notice instead of
+      // overwriting what the user typed.
+      setIdeaNotice(
+        `已生成 idea「${idea.title}」，已填入下方，可自行修改。` +
+          (idea.tags.length > 0 ? `建议方向：${idea.tags.join("、")}` : ""),
+      );
     } catch (e) {
       setError((e as Error).message);
     } finally {

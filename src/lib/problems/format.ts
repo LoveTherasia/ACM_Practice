@@ -174,6 +174,98 @@ export async function checkDeclaredFormat(
   return null;
 }
 
+/**
+ * How many input values a source file reads.
+ *
+ * `readEoln`/`readEof`/`readSpace` are format checks, not values, so only the
+ * value-reading calls are counted. scanf/stream extraction are included because
+ * the solutions read with those rather than testlib.
+ */
+function countInputReads(source: string): number {
+  const testlib =
+    source.match(
+      /\b(?:inf|ouf|ans)\.(?:readInt|readLong|readDouble|readToken|readWord|readStrictDouble|readReal)\s*\(/g,
+    ) ?? [];
+  const scanfs = source.match(/\bscanf\s*\(/g) ?? [];
+  const streamReads = source.match(/\bcin\s*>>/g) ?? [];
+  return testlib.length + scanfs.length + streamReads.length;
+}
+
+/**
+ * Flag "wrong" solutions that never read the problem's input.
+ *
+ * A wrong solution is only useful as an observation probe if it is a real
+ * attempt at the problem: it must consume the declared input and then get it
+ * wrong in a specific way. Measured output on graph-004: both wrong solutions
+ * read a single `n` and printed `n+1` or `0`, never touching an edge. They
+ * compile, the checker rejects them, and they prove nothing - they fail on
+ * every input, so they cannot show that the data defeats any particular
+ * mistake.
+ *
+ * The validator is the reference for "how much input there is", because it is
+ * the artefact that already reads the whole format. A wrong solution reading
+ * less than half as much is not attempting the problem. The floor stops short
+ * problems from being flagged on a rounding difference.
+ */
+export async function checkWrongSolutionSubstance(
+  problemId: string,
+  config: ProblemConfig,
+): Promise<string[]> {
+  if (config.wrongSolutions.length === 0) {
+    return [];
+  }
+
+  let validatorReads: number;
+  try {
+    validatorReads = countInputReads(
+      await fs.readFile(problemPath(problemId, config.validator), "utf8"),
+    );
+  } catch {
+    return [];
+  }
+  // Too small to judge: with only a couple of values the ratio would be noise.
+  if (validatorReads < 4) {
+    return [];
+  }
+
+  const problems: string[] = [];
+  for (const wrong of config.wrongSolutions) {
+    if (wrong.language === "python" || !wrong.path.endsWith(".cpp")) {
+      continue;
+    }
+    let reads: number;
+    try {
+      reads = countInputReads(await fs.readFile(problemPath(problemId, wrong.path), "utf8"));
+    } catch {
+      continue;
+    }
+    // A third of the reference is a generous bar: a real wrong algorithm reads
+    // essentially the same input and then mishandles it. Measured on graph-004,
+    // the validator reads 5 values while both wrong solutions read 1.
+    if (reads * 3 >= validatorReads) {
+      continue;
+    }
+    problems.push(
+      [
+        `### 错解 ${wrong.name} 没有真正读入题目输入`,
+        "```",
+        `validator 读入 ${validatorReads} 个值，而 ${wrong.path} 只读了 ${reads} 个`,
+        "```",
+        "这说明它没有实现一个具体的错误思路，而是把所有输入都忽略掉、直接输出一个常数。",
+        "这种错解能编译、也会被判 WA，但**对任何数据都错**，",
+        "因此无法证明数据能卡住任何一类真实的错误做法，观察价值为零。",
+        "",
+        "请二选一：",
+        "- 改成一个**真的错误算法**：完整读入题面声明的全部输入，",
+        "  然后在一个具体环节上出错（只枚举单点割、重边未累加、`int` 溢出、贪心取局部最优等）；",
+        "- 或者**删掉这个错解**（连同 config.json 的 wrongSolutions 条目）。",
+        "不写错解是完全允许的，比写一个占位错解更好。",
+      ].join("\n"),
+    );
+  }
+  return problems;
+}
+
 /** A repair-facing diagnostic for a first-line mismatch. */
 export function describeFormatMismatch(mismatch: FormatMismatch): string {
   return [

@@ -298,7 +298,7 @@ export async function opencodeWorkspaceComplete(
     );
     child.stdin?.end();
 
-    let lastSignature = "";
+    let lastSignature: string | null = null;
     let quietSince = Date.now();
     const startedAt = Date.now();
 
@@ -309,16 +309,27 @@ export async function opencodeWorkspaceComplete(
         }
         const now = Date.now();
         const signature = files.join("|");
+        if (lastSignature === null) {
+          // First poll: the workspace already contains the spec file, so this
+          // signature is the "before" state, not progress. Only start counting
+          // quiescence once the signature changes (the first real write).
+          lastSignature = signature;
+          quietSince = now;
+          return;
+        }
         if (signature !== lastSignature) {
           lastSignature = signature;
           quietSince = now;
           return;
         }
         const elapsed = now - startedAt;
-        // At least one write must have happened first: a starting agent is
-        // also "quiet", and must not be cut off before it writes anything.
+        // The agent must have written at least one file beyond the spec
+        // before quiescence can end the run: a slow-starting agent (long
+        // thinking, slow model) is quiet too, and must not be cut off
+        // before it writes anything.
+        const wroteAnything = files.some((f) => f !== ".task-spec.md");
         if (
-          lastSignature !== "" &&
+          wroteAnything &&
           now - quietSince >= QUIET_GRACE_MS &&
           elapsed > 30_000
         ) {
