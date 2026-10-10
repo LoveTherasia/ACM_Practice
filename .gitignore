@@ -38,6 +38,17 @@ training/.venv/
 # unsloth compiled-kernel cache (written to the CWD of training runs)
 unsloth_compiled_cache/
 
+# OpenCode experiments: scratch workspaces, exported role specs, and the ad-hoc
+# probe scripts used to work out how the CLI behaves. These are local tooling,
+# not part of the app - and the workspaces contain generated task specs and
+# throwaway files that must not reach the repository.
+/OpenCode/
+/scripts/
+
+# Scratch output from manual OpenCode probes, which write to the CWD.
+/data/
+/hello.txt
+
 # launcher diagnostics
 launcher-debug.log
 .devlog.txt
