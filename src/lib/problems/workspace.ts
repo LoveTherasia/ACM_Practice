@@ -6,7 +6,10 @@ import path from "node:path";
 import { icpcSkillDir, problemDir, problemPath } from "@/lib/paths";
 import { auditCoverage, formatCoverageForLog } from "@/lib/problems/coverage";
 import {
+  checkConfigParseable,
   checkDeclaredFormat,
+  checkGeneratorTypes,
+  checkStatementLanguage,
   checkWrongSolutionSubstance,
   describeFormatMismatch,
 } from "@/lib/problems/format";
@@ -801,6 +804,11 @@ export async function preflightCompile(
 
   const problems: string[] = [];
 
+  // config.json first: it is the file everything else depends on, and a broken
+  // one makes every later check meaningless. It is also the only problem here
+  // that can be reported without parsing the config at all.
+  problems.push(...(await checkConfigParseable(problemId).catch(() => [])));
+
   // Statement-versus-validator alignment first: a mismatch here means the two
   // documents describe different problems, and no other check can see it.
   const mismatch = await checkDeclaredFormat(problemId, config).catch(() => null);
@@ -812,6 +820,17 @@ export async function preflightCompile(
   // it fails on every input, so it cannot show the data defeats any mistake.
   problems.push(
     ...(await checkWrongSolutionSubstance(problemId, config).catch(() => [])),
+  );
+
+  // Chinese prose, and a statement that is not still the scaffold template.
+  problems.push(
+    ...(await checkStatementLanguage(problemId, config).catch(() => [])),
+  );
+
+  // Every declared case type must be one the generator actually implements,
+  // or it silently falls through to the default branch.
+  problems.push(
+    ...(await checkGeneratorTypes(problemId, config).catch(() => [])),
   );
 
   for (const relative of preflightTargets(config)) {

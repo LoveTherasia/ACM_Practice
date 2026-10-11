@@ -266,6 +266,233 @@ export async function checkWrongSolutionSubstance(
   return problems;
 }
 
+/**
+ * The set of case types a generator declares it implements.
+ *
+ * The architect chooses case type names and the judge-validator writes the
+ * generator, so nothing structural ties the two together - and a generator that
+ * dispatches on keywords fails *silently* for a name it does not recognise,
+ * falling through to its default branch. Measured on string-002: the config
+ * declared anti-tle, adversarial-booth, degenerate-palindrome and others, while
+ * the generator only recognised same/period/sorted/reverse/binary/border, so
+ * none of the declared adversarial data existed. Verification passed anyway,
+ * because the fallback data is still valid - the problem simply had none of the
+ * strength it claimed.
+ *
+ * A machine-readable marker turns that silent mismatch into a hard failure. The
+ * judge-validator is asked to write it; nothing else reads it.
+ */
+const SUPPORTED_TYPES = /^[ \t]*(?:\/\/|#)\s*SUPPORTED_TYPES\s*:\s*(.+)$/im;
+
+/** Parse the generator's declared type list. Null when it declares nothing. */
+export function parseSupportedTypes(generatorSource: string): string[] | null {
+  const match = SUPPORTED_TYPES.exec(generatorSource);
+  if (!match?.[1]) {
+    return null;
+  }
+  const types = match[1]
+    .split(/[,，、\s]+/)
+    .map((part) => part.trim())
+    .filter((part) => part !== "");
+  return types.length > 0 ? types : null;
+}
+
+/**
+ * Compare the config's case types with the generator's declared types.
+ *
+ * Only runs when the generator declares a list, so an older workspace without
+ * the marker is skipped rather than reported - a check that fires on every
+ * legacy problem is one nobody reads.
+ */
+export async function checkGeneratorTypes(
+  problemId: string,
+  config: ProblemConfig,
+): Promise<string[]> {
+  let source: string;
+  try {
+    source = await fs.readFile(problemPath(problemId, config.generator.path), "utf8");
+  } catch {
+    return [];
+  }
+
+  const declared = parseSupportedTypes(source);
+  if (!declared) {
+    return [];
+  }
+  const supported = new Set(declared.map((type) => type.trim()));
+  const missing = [...new Set(config.generator.cases.map((c) => c.type))]
+    .filter((type) => !supported.has(type))
+    .sort();
+  if (missing.length === 0) {
+    return [];
+  }
+
+  return [
+    "### generator 没有实现 config 里声明的全部 case type",
+    "```",
+    `config.json 声明的 type：${[...new Set(config.generator.cases.map((c) => c.type))].join(", ")}`,
+    `generator 声明支持的 type：${declared.join(", ")}`,
+    `缺失：${missing.join(", ")}`,
+    "```",
+    "这些 type 会落到 generator 的兜底分支，**静默生成与名字无关的数据**。",
+    "本题的验题**不会因此失败**（兜底数据本身合法），",
+    "所以问题不会被脚本发现——只是那些测试点名不副实，",
+    "题面里承诺的边界/对抗数据实际上一个都不存在，数据强度远低于声称的水平。",
+    "",
+    "请二选一并保持两处一致：",
+    "- 在 `generator.cpp` 里为这些 type 补上真实的构造分支（按 coverage 意图实现），",
+    "  并同步更新文件头的 `// SUPPORTED_TYPES: ...` 声明；",
+    "- 或者修正 `config.json` 的 case 清单，只保留 generator 真正实现的 type。",
+    "注意：不要为了消除报错而把 type 改成兜底分支的名字——那等于承认这些测试点没有强度。",
+  ];
+}
+
+/**
+ * The scaffold marker, used to tell "the architect never ran" apart from
+ * "the architect wrote something wrong".
+ *
+ * create-workspace.ps1 writes this English template into every new workspace,
+ * and it reads "read one integer n and print the same integer" with a hardcoded
+ * sample of 5. When a statement still contains it, the architect stage never
+ * completed - so the workspace is not a problem at all, and every downstream
+ * check is being run against placeholder text.
+ */
+const SCAFFOLD_MARKER = "This scaffold statement is intentionally complete and runnable";
+
+/** Whether a statement is still the untouched scaffold template. */
+export function isScaffoldStatement(statement: string): boolean {
+  return statement.includes(SCAFFOLD_MARKER);
+}
+
+/** Share of CJK among the letters in a text, as a percentage. */
+function chineseRatio(text: string): { cjk: number; latin: number; percent: number } {
+  const cjk = (text.match(/[\u4e00-\u9fff]/g) ?? []).length;
+  const latin = (text.match(/[A-Za-z]/g) ?? []).length;
+  const total = cjk + latin;
+  return { cjk, latin, percent: total === 0 ? 0 : (100 * cjk) / total };
+}
+
+/**
+ * Ensure the statement is written in Chinese.
+ *
+ * The problem statements are for a Chinese-language contest, and the prompts
+ * already say so - but instructing a model is not the same as enforcing it, and
+ * the scaffold's English template is what a reader actually sees when a
+ * generation dies early. This measures the statement instead of trusting it.
+ *
+ * The threshold is deliberately low (a quarter of the letters): a Chinese
+ * statement legitimately carries plenty of Latin - variable names, complexity
+ * notation, YES/NO, LaTeX - so a stricter ratio would fire on good statements.
+ * Below a quarter there is no prose-level Chinese at all.
+ */
+export async function checkStatementLanguage(
+  problemId: string,
+  config: ProblemConfig,
+): Promise<string[]> {
+  let statement: string;
+  try {
+    statement = await fs.readFile(problemPath(problemId, config.statement), "utf8");
+  } catch {
+    return [];
+  }
+
+  if (isScaffoldStatement(statement)) {
+    return [
+      [
+        "### 题面还是脚手架模板，说明 architect 阶段没有完成",
+        "```",
+        `CHECK：docs/statement.md 里仍然是 create-workspace 写入的英文模板：`,
+        `${SCAFFOLD_MARKER}`,
+        "```",
+        "这不是「模型写成了英文」，而是**这一轮生成在 architect 阶段就中断了**：",
+        "config.json 大概率还是模板里的 5 个占位 case，meta.json 也不存在。",
+        "当前工作区不是一个可用的题目。",
+        "",
+        "请删掉这个工作区重新生成。若反复出现，说明 architect 的模型调用在超时或报错",
+        "（可以调大 LLM_TIMEOUT_MS，或换一个更快的模型）。",
+      ].join("\n"),
+    ];
+  }
+
+  const { cjk, percent } = chineseRatio(statement);
+  if (cjk === 0 || percent < 25) {
+    return [
+      [
+        "### 题面不是中文的",
+        "```",
+        `CJK 字符 ${cjk} 个，占字母总数的 ${percent.toFixed(1)}%（要求至少 25%）`,
+        "```",
+        "题面必须用中文书写：正文、标题、样例说明都是中文，",
+        "只有变量名、复杂度记号、`YES`/`NO`、公式等保留原文。",
+        "请把 `docs/statement.md` 整篇改写为中文，并同步检查 `docs/tutorial.md`，",
+        "两处语言要一致。",
+      ].join("\n"),
+    ];
+  }
+  return [];
+}
+
+/**
+ * Ensure config.json is parseable.
+ *
+ * Everything downstream reads this file: the registry cannot list a workspace
+ * whose config will not parse, and run-all-tests.ps1 fails before generating a
+ * single case. A truncated model reply once left a case entry as `"type`
+ * followed by a stray byte, and the workspace became permanently unusable with
+ * no clear explanation. Reporting it here names the file and the position
+ * instead of leaving a mysterious "工作区无法解析" in the console.
+ */
+export async function checkConfigParseable(problemId: string): Promise<string[]> {
+  let raw: string;
+  try {
+    raw = await fs.readFile(problemPath(problemId, "config.json"), "utf8");
+  } catch {
+    return [
+      [
+        "### config.json 不存在",
+        "工作区里没有 config.json，说明生成在很早的阶段就中断了。",
+        "请删掉这个工作区重新生成。",
+      ].join("\n"),
+    ];
+  }
+
+  try {
+    JSON.parse(raw);
+    return [];
+  } catch (error) {
+    const message = (error as Error).message;
+    // Locate the failure so the report points at a line rather than the file.
+    const at = /position (\d+)/.exec(message);
+    let excerpt = "";
+    if (at?.[1]) {
+      const pos = Number.parseInt(at[1], 10);
+      const from = Math.max(0, pos - 120);
+      excerpt = raw
+        .slice(from, pos + 120)
+        .split(/\r?\n/)
+        .map((line) => line.trimEnd())
+        .join("\n");
+    }
+    return [
+      [
+        "### config.json 不是合法 JSON，工作区不可用",
+        "```",
+        message,
+        excerpt ? `...${excerpt}...` : "",
+        "```",
+        "任何工具都无法读取这个工作区：题目库列不出它，验题脚本会在读配置时就失败。",
+        "常见原因是模型回复被 max_tokens 截断，写进去的 JSON 只写了一半。",
+        "",
+        "请删掉这个工作区重新生成。若要降低复现概率：",
+        "- 调大 `LLM_MAX_OUTPUT_TOKENS`（当前上限越大越不容易截断）",
+        "- 或改用输出更稳定的模型（`LLM_MODEL_ARCHITECT` / `LLM_MODEL_WORKER`）",
+      ]
+        .filter((line) => line !== "")
+        .join("\n"),
+    ];
+  }
+}
+
 /** A repair-facing diagnostic for a first-line mismatch. */
 export function describeFormatMismatch(mismatch: FormatMismatch): string {
   return [

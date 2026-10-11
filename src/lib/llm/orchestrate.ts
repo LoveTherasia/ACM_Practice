@@ -729,11 +729,25 @@ async function writeConfig(slug: string, config: ProblemConfig): Promise<void> {
       .join("; ");
     throw new Error(`config.json 合并后校验失败（${issues}）。`);
   }
-  await fs.writeFile(
-    `${problemDir(slug)}/config.json`,
-    `${JSON.stringify(result.data, null, 2)}\n`,
-    "utf8",
-  );
+
+  const serialized = `${JSON.stringify(result.data, null, 2)}\n`;
+  // Belt and braces on the one file that everything else depends on. The
+  // serialisation above is built from validated data, so this should be
+  // unrepresentable - but a malformed config.json breaks the whole workspace
+  // (the registry cannot list it, the verifier cannot parse it), and a
+  // workspace on disk was observed with a truncated string value that no
+  // writer here should be able to produce. Parsing our own output before
+  // committing it turns an unreproducible corruption into a loud failure at
+  // the point of writing.
+  try {
+    JSON.parse(serialized);
+  } catch (error) {
+    throw new Error(
+      `拒绝写入无法解析的 config.json（这属于程序缺陷）：${(error as Error).message}`,
+    );
+  }
+
+  await fs.writeFile(`${problemDir(slug)}/config.json`, serialized, "utf8");
 }
 
 /** Cap the shared context so a runaway statement cannot blow the context budget. */
