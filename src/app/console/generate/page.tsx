@@ -141,6 +141,18 @@ export default function GeneratePage() {
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
+      /**
+       * Whether the server told us how the run ended.
+       *
+       * The stream can close without a `done` or `error` frame - the server
+       * process dies, the connection is dropped, or the run was aborted - and
+       * the loop below then just ends. Without this flag the page kept its
+       * "running" state forever and showed only the last event it managed to
+       * receive (typically "已创建工作区"), which reads as if the run were
+       * still in progress. The problem workspace could meanwhile be complete or
+       * half-written on disk, with nothing in the UI to say so.
+       */
+      let sawTerminalEvent = false;
 
       for (;;) {
         const { done, value } = await reader.read();
@@ -156,11 +168,24 @@ export default function GeneratePage() {
             continue;
           }
           try {
-            handleEvent(JSON.parse(line.slice(6)) as PipelineEvent);
+            const event = JSON.parse(line.slice(6)) as PipelineEvent;
+            if (event.type === "done" || event.type === "error") {
+              sawTerminalEvent = true;
+            }
+            handleEvent(event);
           } catch {
             // A malformed frame must not kill the stream.
           }
         }
+      }
+
+      if (!sawTerminalEvent) {
+        setError(
+          "进度流在结束前就断开了，没有收到完成或失败事件。这通常意味着服务端在造题过程中被重启或中断。" +
+            "题目工作区可能只写了一半，请到题目库确认它的实际状态，必要时删掉重新生成。",
+        );
+        setRunning(false);
+        setConnected(false);
       }
     } catch (e) {
       setError((e as Error).message);

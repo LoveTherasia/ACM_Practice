@@ -91,6 +91,23 @@ export async function POST(request: Request) {
       };
       request.signal.addEventListener("abort", onAbort, { once: true });
 
+      /**
+       * Keep the connection alive while the pipeline is silent.
+       *
+       * A single architect call can take well over a minute with a reasoning
+       * model, and nothing at all is written to the stream in that time. An
+       * idle connection is a candidate for being dropped - by a proxy, or by
+       * the browser - and when it drops the client loses every later event: the
+       * user sees the last frame that arrived ("已创建工作区") and nothing else,
+       * even though the run continues and may well finish. Comment frames are
+       * ignored by the SSE parser by definition, so they cost nothing.
+       */
+      const heartbeat = setInterval(() => {
+        if (!closed) {
+          controller.enqueue(encoder.encode(": ping\n\n"));
+        }
+      }, 15_000);
+
       try {
         await runPipeline(brief, send);
       } catch (error) {
@@ -100,6 +117,7 @@ export async function POST(request: Request) {
           message: (error as Error).message,
         });
       } finally {
+        clearInterval(heartbeat);
         request.signal.removeEventListener("abort", onAbort);
         if (!closed) {
           controller.close();
