@@ -1,10 +1,18 @@
 import { execFile } from "node:child_process";
 import { promises as fs } from "node:fs";
-import os from "node:os";
 import path from "node:path";
 
 import { icpcSkillDir, problemDir, problemPath } from "@/lib/paths";
+import {
+  assertProblemReservation,
+  consumeProblemReservation,
+} from "@/lib/problems/category";
 import { auditCoverage, formatCoverageForLog } from "@/lib/problems/coverage";
+import {
+  checkDeclaredSamples,
+  describeSampleSync,
+  syncDeclaredSamples,
+} from "@/lib/problems/samples";
 import {
   checkConfigParseable,
   checkDeclaredFormat,
@@ -18,6 +26,7 @@ import {
   type ProblemConfig,
   type Verification,
 } from "@/lib/problems/schema";
+import { runSandbox, withSandboxScratch } from "@/lib/sandbox/docker";
 
 /**
  * Bridge to the vendored PowerShell toolchain.
@@ -190,6 +199,7 @@ async function isCompletedProblem(target: string): Promise<boolean> {
 export async function createWorkspace(
   problemId: string,
   interactive: boolean,
+  reservationId?: string,
 ): Promise<string> {
   const target = problemDir(problemId);
   if (await isCompletedProblem(target)) {
@@ -200,10 +210,14 @@ export async function createWorkspace(
 
   await fs.mkdir(path.dirname(target), { recursive: true });
 
+  if (reservationId) {
+    await assertProblemReservation(problemId, reservationId);
+  }
+
   // Reclaim a leftover directory from a crashed or failed run: it only ever
   // contains scaffold output or partial generations, never anything the
   // user made by hand (hand-made problems carry meta.json via the registry).
-  if (await exists(target)) {
+  if ((await exists(target)) && !reservationId) {
     await fs.rm(target, { recursive: true, force: true });
   }
 
@@ -228,7 +242,13 @@ export async function createWorkspace(
   const scaffolded = path.join(icpcSkillDir, "examples", slug);
   if (await exists(scaffolded)) {
     await fs.mkdir(path.dirname(target), { recursive: true });
-    await moveDirectory(scaffolded, target);
+    if (reservationId) {
+      await fs.cp(scaffolded, target, { recursive: true });
+      await fs.rm(scaffolded, { recursive: true, force: true });
+      await consumeProblemReservation(problemId);
+    } else {
+      await moveDirectory(scaffolded, target);
+    }
   } else if (!(await exists(target))) {
     throw new Error(`脚手架未在预期位置生成: ${scaffolded}`);
   }
@@ -490,28 +510,6 @@ function preflightTargets(config: ProblemConfig): string[] {
   return [...new Set(targets.filter(Boolean))];
 }
 
-function runCompiler(
-  args: string[],
-  cwd: string,
-): Promise<{ code: number; stderr: string }> {
-  return new Promise((resolve) => {
-    execFile(
-      process.env.CPP_COMPILER?.trim() || "g++",
-      args,
-      { cwd, timeout: 90_000, maxBuffer: 16 * 1024 * 1024, windowsHide: true },
-      (error, _stdout, stderr) => {
-        const code =
-          error && typeof (error as { code?: unknown }).code === "number"
-            ? Number((error as { code: number }).code)
-            : error
-              ? 1
-              : 0;
-        resolve({ code, stderr: String(stderr) });
-      },
-    );
-  });
-}
-
 /**
  * Run the reference solutions against each other on one small case.
  *
@@ -527,151 +525,84 @@ function runCompiler(
  * verification run, and the repair loop then tries to fix the checker - which
  * is not what is wrong.
  */
-async function smokeTestReferences(
+/**
+ * Apply the statement's declared samples to a problem's verifier data.
+ *
+ * The counterpart to the sync the generation pipeline performs. Re-verification
+ * and generation must apply the same sample discipline, otherwise a hand-fixed
+ * statement can never be confirmed: the generator's sample data may predate the
+ * fix, and run-all-tests.ps1 regenerates inputs from the generator, so a
+ * statement-only correction would be silently overwritten.
+ *
+ * Returns the repair-facing diagnostics for a statement-versus-solution
+ * contradiction, or an empty list when the samples agree (or cannot be checked).
+ */
+export async function checkSamplesAgainstSolutions(
   problemId: string,
-  config: ProblemConfig,
-  generatorBinary: string,
-  type: string,
-  workDir: string,
 ): Promise<string[]> {
-  const references = config.solutions
-    .filter((entry) => entry.language !== "python" && entry.path.endsWith(".cpp"))
-    .slice(0, 2);
-  if (references.length < 2) {
+  const config = await readConfigFile(problemId).catch(() => null);
+  if (!config) {
     return [];
   }
-
-  const binaries: { name: string; path: string }[] = [];
-  for (const entry of references) {
-    const source = problemPath(problemId, entry.path);
-    if (!(await exists(source))) {
-      return [];
-    }
-    const binary = path.join(
-      workDir,
-      `${entry.name}${process.platform === "win32" ? ".exe" : ""}`,
-    );
-    const build = await runCompiler(
-      ["-std=gnu++20", "-O1", "-I", problemPath(problemId, "include"), source, "-o", binary],
-      problemDir(problemId),
-    );
-    if (build.code !== 0) {
-      // A reference solution that does not compile is reported by the
-      // compile preflight, which has far better diagnostics.
-      return [];
-    }
-    binaries.push({ name: entry.name, path: binary });
-  }
-
-  // Produce one input with the generator binary the caller already built.
-  const inputPath = path.join(workDir, "cross.in");
-  const run = await runProcessInDir(
-    generatorBinary,
-    [type, "1"],
-    workDir,
-    inputPath,
-    60_000,
-  );
+  const run = await referenceRunner(problemId, config).catch(() => null);
   if (!run) {
     return [];
   }
-
-  const outputs: { name: string; text: string }[] = [];
-  for (const binary of binaries) {
-    const result = await runWithStdin(
-      binary.path,
-      [],
-      workDir,
-      inputPath,
-      20_000,
-    );
-    // A solution that crashes or exceeds the budget on the sample is a
-    // different problem, and guessing here would risk a false accusation.
-    if (!result || result.code !== 0) {
-      return [];
-    }
-    outputs.push({ name: binary.name, text: normalizeOutput(result.stdout) });
-  }
-
-  const [first, second] = outputs;
-  if (!first || !second || first.text === second.text) {
-    return [];
-  }
-
-  return [
-    "### 两份标程在同一个测试点上给出不同答案",
-    "```",
-    `输入（generator type=${type} seed=1）：${inputPath}`,
-    `${first.name} 输出：${first.text.slice(0, 200) || "(空)"}`,
-    `${second.name} 输出：${second.text.slice(0, 200) || "(空)"}`,
-    "```",
-    "两份标程都被声明为正确实现，**它们必须给出相同答案**；不一致说明至少有一份是错的。",
-    "注意：不要为了让两者一致而改答案，要找出真正错的那一份。常见原因：",
-    "- 某个临时数组/状态没有按 case 重置，小数据恰好正确、大数据出错；",
-    "- 运算溢出（该用 `long long` 却用了 `int`，或中间量溢出）；",
-    "- 边界少算一项（循环少跑一轮、漏掉最后一个元素）；",
-    "- 其中一份实际上算的是另一个量（与题面要求不一致）。",
-  ];
+  const synced = await syncDeclaredSamples(problemId, config, (_name, input) =>
+    run(input),
+  ).catch(() => null);
+  return synced ? describeSampleSync(synced) : [];
 }
 
-/** Whitespace-insensitive comparison, matching how the verifier compares. */
-function normalizeOutput(text: string): string {
-  return text
-    .replace(/\r\n/g, "\n")
-    .trim()
-    .split("\n")
-    .map((line) => line.trim())
-    .join("\n");
-}
-
-/** Write a generator's stdout to a file, returning false if it failed. */
-async function runProcessInDir(
-  file: string,
-  args: string[],
-  cwd: string,
-  outputFile: string,
-  timeoutMs: number,
-): Promise<boolean> {
-  const result = await runProcess(file, args, cwd, timeoutMs);
-  if (result.code !== 0) {
-    return false;
+/**
+ * Compile the main solution once and return a runner for arbitrary inputs.
+ *
+ * Used to check the statement's declared sample outputs against a real answer.
+ * Returns null when the solution cannot be built, so the caller skips the check
+ * rather than reporting a mismatch it cannot substantiate.
+ */
+export async function referenceRunner(
+  problemId: string,
+  config: ProblemConfig,
+): Promise<((input: string) => Promise<string | null>) | null> {
+  const main =
+    config.solutions.find((entry) => entry.role === "main") ?? config.solutions[0];
+  if (!main || main.language === "python" || !main.path.endsWith(".cpp")) {
+    return null;
   }
-  await fs.writeFile(outputFile, result.stdout, "utf8");
-  return true;
-}
 
-/** Run a program with a file on stdin. Null when it could not be run. */
-function runWithStdin(
-  file: string,
-  args: string[],
-  cwd: string,
-  inputFile: string,
-  timeoutMs: number,
-): Promise<{ code: number; stdout: string; stderr: string } | null> {
-  return new Promise((resolve) => {
-    fs.readFile(inputFile)
-      .then((data) => {
-        const child = execFile(
-          file,
-          args,
-          { cwd, timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024, windowsHide: true },
-          (error, stdout, stderr) => {
-            const code =
-              error && typeof (error as { code?: unknown }).code === "number"
-                ? Number((error as { code: number }).code)
-                : error
-                  ? 1
-                  : 0;
-            resolve({ code, stdout: String(stdout), stderr: String(stderr) });
-          },
-        );
-        // A solution may exit before reading everything; that is its business,
-        // and the exit code above already captures it.
-        child.stdin?.on("error", () => {});
-        child.stdin?.end(data);
-      })
-      .catch(() => resolve(null));
-  });
+  const source = problemPath(problemId, main.path);
+  if (!(await exists(source))) {
+    return null;
+  }
+
+  return async (input: string) => {
+    return withSandboxScratch(async (scratch) => {
+      await fs.chmod(scratch, 0o777).catch(() => {});
+      const build = await runSandbox({
+        command: "g++",
+        args: ["-std=gnu++20", "-O2", "-I/problem/include", "/problem/source.cpp", "-o", "/work/main"],
+        mounts: [
+          { hostPath: scratch, containerPath: "/work" },
+          { hostPath: source, containerPath: "/problem/source.cpp", readOnly: true },
+          { hostPath: problemPath(problemId, "include"), containerPath: "/problem/include", readOnly: true },
+        ],
+        timeoutMs: 90_000,
+        memoryMb: 1024,
+        maxOutputBytes: 4 * 1024 * 1024,
+      });
+      if (build.code !== 0) return null;
+      const run = await runSandbox({
+        command: "/work/main",
+        mounts: [{ hostPath: scratch, containerPath: "/work" }],
+        input,
+        timeoutMs: 20_000,
+        memoryMb: Math.max(config.memoryLimitMb, 16),
+        maxOutputBytes: 16 * 1024 * 1024,
+      });
+      return run.code === 0 && !run.timedOut ? run.stdout : null;
+    });
+  };
 }
 
 /**
@@ -688,102 +619,6 @@ function runWithStdin(
  * the expensive verification run. Any single case failing is enough: the
  * generator is shared by all cases, so one failure means all of them.
  */
-async function smokeTestGenerator(
-  problemId: string,
-  config: ProblemConfig,
-  includeDir: string,
-): Promise<string[]> {
-  const source = problemPath(problemId, config.generator.path);
-  if (!(await exists(source))) {
-    return [];
-  }
-
-  const binDir = await fs.mkdtemp(path.join(os.tmpdir(), "acm-preflight-"));
-  const binary = path.join(
-    binDir,
-    process.platform === "win32" ? "generator.exe" : "generator",
-  );
-
-  try {
-    const build = await runCompiler(
-      ["-std=gnu++20", "-O1", "-I", includeDir, source, "-o", binary],
-      problemDir(problemId),
-    );
-    if (build.code !== 0) {
-      // The compile preflight already reports this properly.
-      return [];
-    }
-
-    // One distinct type is enough to detect a missing branch or a crash on
-    // start, and three keeps the cost trivial while covering the sample type
-    // plus at least one real case.
-    const types = [...new Set(config.generator.cases.map((c) => c.type))].slice(0, 3);
-    const outputDir = path.join(binDir, "out");
-
-    for (const type of types) {
-      await fs.mkdir(outputDir, { recursive: true });
-      const result = await runProcess(binary, [type, "1"], outputDir, 60_000);
-      if (result.code !== 0) {
-        const detail = (result.stderr || result.stdout)
-          .split(/\r?\n/)
-          .map((line) => line.trim())
-          .filter(Boolean)
-          .slice(0, 4)
-          .join("\n");
-        return [
-          `### generator 运行失败（type=${type}）`,
-          "```",
-          detail || `进程退出码 ${result.code}，且没有输出任何信息`,
-          "```",
-          `这条数据是 generator 直接运行 \`${config.generator.path} ${type} 1\` 的结果。`,
-          "generator 被所有测试点共用，所以**一个 type 跑不通，全部测试点都会失败**。",
-          "常见原因：`type == \"...\"` 分支没有覆盖 config 里规划的全部 type（会输出 `FAIL unknown type ...`）、",
-          "数组越界、随机范围写反导致断言失败、或读入了一个不存在的文件。",
-        ];
-      }
-    }
-
-    // Everything runs; now check that the two reference solutions agree.
-    return await smokeTestReferences(
-      problemId,
-      config,
-      binary,
-      types[0] ?? "sample",
-      binDir,
-    );
-  } catch {
-    // The smoke test is best-effort; verification still decides the outcome.
-    return [];
-  } finally {
-    await fs.rm(binDir, { recursive: true, force: true }).catch(() => {});
-  }
-}
-
-/** Run a binary, capturing stdout/stderr and enforcing a timeout. */
-function runProcess(
-  file: string,
-  args: string[],
-  cwd: string,
-  timeoutMs: number,
-): Promise<{ code: number; stdout: string; stderr: string }> {
-  return new Promise((resolve) => {
-    execFile(
-      file,
-      args,
-      { cwd, timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024, windowsHide: true },
-      (error, stdout, stderr) => {
-        const code =
-          error && typeof (error as { code?: unknown }).code === "number"
-            ? Number((error as { code: number }).code)
-            : error
-              ? 1
-              : 0;
-        resolve({ code, stdout: String(stdout), stderr: String(stderr) });
-      },
-    );
-  });
-}
-
 /**
  * Compile every source file without producing a binary.
  *
@@ -796,7 +631,6 @@ export async function preflightCompile(
   problemId: string,
   config: ProblemConfig,
 ): Promise<string[]> {
-  const root = problemDir(problemId);
   const includeDir = problemPath(problemId, "include");
   if (!(await exists(path.join(includeDir, PREFLIGHT_HEADER)))) {
     return [];
@@ -833,18 +667,33 @@ export async function preflightCompile(
     ...(await checkGeneratorTypes(problemId, config).catch(() => [])),
   );
 
+  // The statement's own samples against the generated data. This is the only
+  // mechanical link between the statement and the artefacts, and it is what
+  // catches a problem whose solutions answer a different question than the one
+  // asked - the failure mode that mattered most, because self-consistency makes
+  // it invisible to every other check.
+  problems.push(
+    ...(await checkDeclaredSamples(problemId, config).catch(() => [])),
+  );
+
   for (const relative of preflightTargets(config)) {
     const absolute = problemPath(problemId, relative);
-    if (!(await exists(absolute))) {
-      continue;
-    }
-    const { code, stderr } = await runCompiler(
-      ["-std=gnu++20", "-fsyntax-only", "-I", includeDir, absolute],
-      root,
+    if (!(await exists(absolute))) continue;
+    const { code, stderr } = await withSandboxScratch(async (scratch) =>
+      runSandbox({
+        command: "g++",
+        args: ["-std=gnu++20", "-fsyntax-only", "-I/problem/include", "/problem/source.cpp"],
+        mounts: [
+          { hostPath: scratch, containerPath: "/work" },
+          { hostPath: absolute, containerPath: "/problem/source.cpp", readOnly: true },
+          { hostPath: includeDir, containerPath: "/problem/include", readOnly: true },
+        ],
+        timeoutMs: 90_000,
+        memoryMb: 1024,
+        maxOutputBytes: 16 * 1024 * 1024,
+      }),
     );
-    if (code === 0) {
-      continue;
-    }
+    if (code === 0) continue;
     // Keep the compiler's own wording (it names the construct that is wrong)
     // but drop the absolute workspace prefixes and cap the volume: a broken
     // file can emit hundreds of cascade lines and the first few carry the cause.
@@ -857,10 +706,9 @@ export async function preflightCompile(
     problems.push(`### ${relative}\n\`\`\`\n${detail || "(编译器未给出可读信息)"}\n\`\`\``);
   }
 
-  // Only worth running the generator if everything compiled.
-  if (problems.length === 0) {
-    problems.push(...(await smokeTestGenerator(problemId, config, includeDir)));
-  }
+  // Runtime smoke tests are deliberately left to verifyWorkspace, which runs
+  // the whole toolchain inside one isolated container. Never execute a
+  // generated binary in the host-side preflight.
 
   return problems;
 }
@@ -879,7 +727,54 @@ export async function verifyWorkspace(
   // has to live on the verify path, not only on the scaffold path.
   await ensureWorkspaceAssets(problemId);
 
-  const result = await runScript(absolute, ["-Workspace", problemDir(problemId)], 900_000);
+  // The verifier compiles and executes generated code, so run the complete
+  // PowerShell toolchain inside the same locked-down container used for
+  // submissions. The problem is read-only; only the isolated artifact mount is
+  // writable and copied back after a successful container run.
+  const result = await withSandboxScratch(async (scratch) => {
+    const artifacts = path.join(scratch, "artifacts");
+    await fs.mkdir(artifacts, { recursive: true });
+    await fs.chmod(artifacts, 0o777).catch(() => {});
+    const sandbox = await runSandbox({
+      command: "pwsh",
+      args: [
+        "-NoProfile",
+        "-File",
+        "/skill/scripts/run-all-tests.ps1",
+        "-Workspace",
+        "/problem",
+        "-ArtifactRoot",
+        "/artifacts",
+      ],
+      mounts: [
+        { hostPath: icpcSkillDir, containerPath: "/skill", readOnly: true },
+        { hostPath: problemDir(problemId), containerPath: "/problem", readOnly: true },
+        { hostPath: artifacts, containerPath: "/artifacts" },
+      ],
+      timeoutMs: 900_000,
+      memoryMb: 2048,
+      cpus: 2,
+      pidsLimit: 128,
+      maxOutputBytes: 64 * 1024 * 1024,
+      tmpfsMb: 256,
+    });
+
+    // Judging consumes these artifacts later. Copy only the expected build
+    // tree from the private mount, never anything written elsewhere.
+    const sourceBuild = path.join(artifacts, "build", problemId.split("/")[1] ?? "");
+    if (await exists(sourceBuild)) {
+      const destination = path.join(icpcSkillDir, ".codex-test-artifacts", "build", problemId.split("/")[1] ?? "");
+      await fs.rm(destination, { recursive: true, force: true });
+      await fs.mkdir(path.dirname(destination), { recursive: true });
+      await fs.cp(sourceBuild, destination, { recursive: true });
+    }
+    return {
+      code: sandbox.code,
+      stdout: sandbox.stdout,
+      stderr: sandbox.stderr,
+      output: `${sandbox.stdout}\n${sandbox.stderr}`,
+    } satisfies RunResult;
+  });
   let verification = parseVerification(problemId, result.output, result.code);
 
   // A crash produces no failure lines, so the parsed report would read as

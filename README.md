@@ -26,6 +26,14 @@ Ollama 本地模型 → 回接控制台，实现完全离线出题
 - **本地验题闭环**：编译预检、数据覆盖审计、testlib 驱动的 generator/validator/checker 全量测试，失败自动进入修复轮
 - **训练数据自动积累**：只采集验题通过的完整对话，用于微调本地模型
 - **Web 控制台**：出题进度实时流式展示、题目库管理、模型配置、AI 出 idea
+- **安全执行沙箱**：生成代码、checker 和用户提交只在 Docker 容器中运行；Docker 不可用时 fail-closed
+- **Special Judge**：普通题的 `src/checker/checker.cpp` 按 testlib 的 input/output/answer 三文件协议判题，支持多解与误差判定
+
+### 安全执行要求
+
+验题脚本会拒绝直接在宿主机运行。请先安装并启动 Docker Desktop，然后执行
+`npm run sandbox:build`。每次运行使用一次性容器：无网络、只读根文件系统、非 root
+用户、删除全部 capabilities、禁止提权，并限制 CPU、内存、进程数、文件大小、运行时间和输出量。
 
 ## 快速开始
 
@@ -41,6 +49,7 @@ Ollama 本地模型 → 回接控制台，实现完全离线出题
 ```bash
 npm install
 cp .env.example .env.local   # 填入模型凭据
+npm run sandbox:build         # 启动 Docker 后构建代码执行沙箱
 npm run dev                  # http://localhost:3000
 ```
 

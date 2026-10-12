@@ -37,11 +37,14 @@ import {
   dropMissingSolutionEntries,
   type GeneratedFile,
   preflightCompile,
+  referenceRunner,
   verificationEnabled,
   verifyWorkspace,
   writeGeneratedFiles,
 } from "@/lib/problems/workspace";
+import { describeSampleSync, syncDeclaredSamples } from "@/lib/problems/samples";
 import { auditCoverage, summarizeCoverage } from "@/lib/problems/coverage";
+import { codeStylePromptBlock, styleSkillDir } from "@/lib/llm/style";
 
 /**
  * The generation pipeline.
@@ -834,7 +837,7 @@ export async function runPipeline(
 
   advance("architect", "running");
   try {
-    await createWorkspace(problemId, brief.interactive);
+    await createWorkspace(problemId, brief.interactive, allocation.reservationId);
     log("architect", `已创建工作区 problems/${problemId}`);
 
     const { reply, wrote: architectWrote } = await completeRole(
@@ -976,13 +979,18 @@ export async function runPipeline(
 
     /* ---------------- parallel workers ---------------- */
 
+    // The author's ACM code style, applied to every C++ file the workers write.
+    // It lives in a vendored skill; when that skill is absent the block is empty
+    // and the workers fall back to plain C++, so a checkout without it still runs.
+    const styleDir = await styleSkillDir();
+    const codeStyle = styleDir ? codeStylePromptBlock(styleDir) : "";
+
     const workerSpecs: {
       role: PipelineRole;
       model: string;
       system: string;
       targets: string[];
-    }[] = [
-      {
+    }[] = [      {
         role: "judge-validator",
         model: workerModel(),
         system: judgeValidatorSystem(brief),
@@ -997,7 +1005,7 @@ export async function runPipeline(
       {
         role: "solutions-tutorial",
         model: workerModel(),
-        system: solutionsTutorialSystem(brief),
+        system: solutionsTutorialSystem(brief, codeStyle),
         targets: ["src/solution.cpp", "src/solution2.cpp", "docs/tutorial.md"],
       },
     ];
@@ -1133,6 +1141,35 @@ export async function runPipeline(
           ? `写出 ${result.written.length} 个文件，并更新 ${Object.keys(patch).join("、")}`
           : `写出 ${result.written.length} 个文件`,
       });
+    }
+
+    // A failed worker is fatal for the whole run. The scaffold templates its
+    // files were supposed to replace cannot pass verification, so running the
+    // integrator and four repair rounds against them only burns model calls
+    // before reaching the same failure - observed on graph-005, where the
+    // judge-validator role failed, its template generator.cpp stayed in place,
+    // and every later round died on "Unknown case type" with zero files fixed.
+    const failedWorkers = workerSpecs.filter(
+      (spec) => stages.find((s) => s.role === spec.role)?.status === "failed",
+    );
+    if (failedWorkers.length > 0) {
+      const detail = failedWorkers
+        .map(
+          (spec) =>
+            `${spec.role}（负责 ${spec.targets.join("、")}）：${
+              stages.find((s) => s.role === spec.role)?.error ?? "未知原因"
+            }`,
+        )
+        .join("；");
+      for (const skipRole of ["integrator", "verifier"] as const) {
+        advance(skipRole, "skipped", {
+          summary: "并行角色失败，已跳过",
+        });
+      }
+      throw new Error(
+        `并行角色失败，流水线提前终止：${detail}。` +
+          "工作区里仍是脚手架模板，无法通过验题；请重试生成或换用更强的模型。",
+      );
     }
 
     let merged = await readConfig(problemId);
@@ -1286,6 +1323,65 @@ export async function runPipeline(
         log("verifier", `数据覆盖审计跳过：${(error as Error).message}`);
       }
 
+      // Template-residue guard: if the generator is still the scaffold
+      // template (or implements far fewer case types than the config plans),
+      // the judge-validator role never produced its output. Verification and
+      // repair rounds cannot fix that - the repair prompt only rewrites
+      // source files, and rewriting the generator from scratch inside a
+      // repair round is exactly what the workers are for. Fail fast with a
+      // clear reason instead (observed on graph-005: template generator,
+      // 20 planned types, 5 implemented, four wasted repair rounds).
+      try {
+        const generatorSource = await readIfPresent(
+          problemId,
+          "src/generator/generator.cpp",
+        );
+        if (generatorSource) {
+          const plannedTypes = new Set(
+            (await readConfig(problemId)).generator.cases.map((c) => c.type),
+          );
+          const implemented = new Set<string>();
+          for (const match of generatorSource.matchAll(
+            /type\s*==\s*"([^"]+)"/g,
+          )) {
+            if (match[1]) {
+              implemented.add(match[1]);
+            }
+          }
+          const missing = [...plannedTypes].filter(
+            (t) => !implemented.has(t),
+          );
+          // The scaffold template implements exactly these five generic
+          // types; a real generator implements the planned ones.
+          const isTemplate =
+            implemented.size === 5 &&
+            ["sample", "min", "max", "random-small", "random-large"].every(
+              (t) => implemented.has(t),
+            );
+          if (isTemplate && plannedTypes.size > 5) {
+            throw new Error(
+              "generator.cpp 仍是脚手架模板（judge-validator 角色未产出）。" +
+                "config 规划的测试点无法由模板生成，修复轮无法补救；" +
+                "请重试生成或换用更强的模型。",
+            );
+          }
+          if (missing.length > 0 && missing.length >= plannedTypes.size / 2) {
+            log(
+              "verifier",
+              `警告：config 规划了 ${plannedTypes.size} 种 case type，` +
+                `generator 只实现了 ${implemented.size} 种（缺失 ${missing.length} 种：` +
+                `${missing.slice(0, 5).join("、")}${missing.length > 5 ? " 等" : ""}）。` +
+                "数据计划与实现严重脱节，验题大概率失败。",
+            );
+          }
+        }
+      } catch (error) {
+        if ((error as Error).message.includes("脚手架模板")) {
+          throw error;
+        }
+        log("verifier", `模板残留检测跳过：${(error as Error).message}`);
+      }
+
       // Align config case types with the generator's implemented branches.
       // Models sometimes decorate type names when writing the generator
       // (config says "sorted", generator implements "sorted-small"), which
@@ -1377,7 +1473,66 @@ export async function runPipeline(
       let previousSignature: string | null = null;
       let stagnantRounds = 0;
 
+      // Compile the main solution once, for checking the statement's declared
+      // sample outputs against a real answer.
+      const referenceRun = await referenceRunner(
+        problemId,
+        await readConfig(problemId),
+      ).catch(() => null);
+
+      /** Set when the statement and the solution contradict each other. */
+      let sampleContradiction: string[] = [];
+      /**
+       * Whether the statement's samples have been forced into the data set.
+       *
+       * The verifier's data does not exist until it has run once, so the sync
+       * cannot happen before the first round - it is attempted on the round
+       * after the data appears, and the cases are then verified for real.
+       */
+      let samplesSynced = false;
+
       for (let round = 0; round <= MAX_REPAIR_ROUNDS; round += 1) {
+        // Once the verifier has produced test data, replace the sample inputs
+        // with the ones the statement declares and check them properly.
+        //
+        // A prompt asking the generator to reproduce the declared samples is not
+        // a guarantee: one run emitted 1000 random values for a sample the
+        // statement declared as "5 3 / 1 2 1 3 2", and another declared a sample
+        // answer of 4 where the correct answer was 3 - both invisible, because
+        // the sample never reached the verifier at all.
+        if (!samplesSynced && round > 0 && referenceRun) {
+          samplesSynced = true;
+          try {
+            const synced = await syncDeclaredSamples(
+              problemId,
+              await readConfig(problemId),
+              (_name, input) => referenceRun(input),
+            );
+            if (synced.skipped) {
+              log("verifier", `样例同步跳过：${synced.skipped}`);
+            } else if (synced.written.length > 0) {
+              log(
+                "verifier",
+                `已用题面样例覆盖 ${synced.written.length} 个 sample 数据点，并已清除其过期答案`,
+              );
+            }
+            sampleContradiction = describeSampleSync(synced);
+            if (sampleContradiction.length > 0) {
+              // A declared sample output that disagrees with the solution is a
+              // statement-versus-solution contradiction. A repair round may only
+              // rewrite src/ files, so a wrong statement could never be fixed by
+              // one - report instead of burning rounds on it.
+              log(
+                "verifier",
+                "题面样例输出与标程答案冲突，修复轮无权改题面，停止并上报。",
+              );
+              break;
+            }
+          } catch (error) {
+            log("verifier", `样例同步失败：${(error as Error).message}`);
+          }
+        }
+
         try {
           verification = await verifyWorkspace(problemId);
         } catch (error) {
@@ -1514,8 +1669,45 @@ export async function runPipeline(
             }
           }
         }
+        // Some failure kinds never mention a .cpp path, so the extraction
+        // above misses the file that needs fixing and the model concludes
+        // nothing needs changing (observed twice: graph-005, where
+        // "Unknown case type" only names generator.exe; math-002, where
+        // "checker 未接受" only names .ans files - in both cases several
+        // repair rounds changed zero files). Map failure kinds to the source
+        // file they implicate and force it into the prompt.
+        const failureText = verification.failures
+          .map((f) => f.message)
+          .join("\n");
+        if (failureText.includes("Unknown case type")) {
+          mentionedFiles.add("src/generator/generator.cpp");
+        }
+        if (
+          failureText.includes("checker 未接受") ||
+          failureText.includes("checker failed") ||
+          /FAIL .*violates the range/.test(failureText)
+        ) {
+          // A range violation inside the checker means the checker's own
+          // read bounds reject a legal answer (e.g. -1 for unreachable).
+          mentionedFiles.add("src/checker/checker.cpp");
+          mentionedFiles.add("src/checker/interactor.cpp");
+        }
+        if (failureText.includes("validator 失败") || failureText.includes("validator failed")) {
+          mentionedFiles.add("src/validator/validator.cpp");
+        }
+        if (failureText.includes("编译失败")) {
+          // Compile failures name the file in the diagnostics, but the
+          // extraction above only looks at the first 10 failure messages
+          // and the path format can vary. Force every .cpp that appears
+          // anywhere in the failure text into the prompt.
+          for (const match of failureText.matchAll(
+            /src[/\\][\w./\\-]+\.cpp/g,
+          )) {
+            mentionedFiles.add(match[0].replace(/\\/g, "/"));
+          }
+        }
         const fileContents = await Promise.all(
-          [...mentionedFiles].slice(0, 3).map(async (rel) => {
+          [...mentionedFiles].slice(0, 4).map(async (rel) => {
             const content = await readIfPresent(problemId, rel);
             return content
               ? `### ${rel}\n\`\`\`cpp\n${truncate(content, 8000)}\n\`\`\``
@@ -1580,6 +1772,12 @@ export async function runPipeline(
                   "- validator 拒绝（Expected EOF/EOLN 等）：**generator 的输出行数或格式与 validator 的解析不一致**。",
                   "  以题面的输入格式为准：题面写几行，generator 就输出几行、validator 就读几行。",
                   "  通常是 generator 多输出/少输出了行，或 validator 少读了后续行——对照题面修正两者。",
+                  "- checker 报 Expected EOF：**readToken 之后没有 readEoln 就 readEof**。",
+                  "  testlib 的 readToken 停在 token 边界，行尾换行还留在流里，直接 readEof 会报",
+                  "  「wrong output format Expected EOF」。修法：readToken 后先 readEoln() 再 readEof()。",
+                  "- checker 报 violates the range 且答案是 -1：**readLong 的范围参数拒绝了 -1**。",
+                  "  题面说无解输出 -1 时，标准答案与选手输出都可能是 -1。修法：先 readToken 读出字符串，",
+                  "  是 \"-1\" 就直接当 -1 处理，否则手动解析为整数并校验范围；两侧（ans 与 ouf）都要这样处理。",
                   "",
                   "**修编译错误时的硬性要求**：",
                   "- 只做**最小必要修改**，不要重写整个文件、不要改与报错无关的逻辑。",
@@ -1669,7 +1867,17 @@ export async function runPipeline(
         }
       }
 
-      if (verification) {
+      if (sampleContradiction.length > 0) {
+        // The statement and the solution disagree about the sample. Report it as
+        // a verifier failure with the full diagnostic: this is not fixable by a
+        // repair round, which may only rewrite src/ files, and the statement may
+        // be the side that is wrong.
+        advance("verifier", "failed", {
+          summary: "题面样例与标程冲突",
+          error: "题面声明的样例输出与标程答案不一致",
+        });
+        log("verifier", sampleContradiction.join("\n\n"));
+      } else if (verification) {
         await patchMeta(problemId, { verification });
         if (verification.passed) {
           advance("verifier", "done", {

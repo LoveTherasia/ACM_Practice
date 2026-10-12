@@ -1,0 +1,119 @@
+[
+  {
+    "Id": "data-struct/data-struct-001",
+    "Verdict": "PASS",
+    "Cases": "34/34",
+    "Fails": 0,
+    "SampleIssues": 0,
+    "Secs": 173.0,
+    "Err": ""
+  },
+  {
+    "Id": "data-struct/data-struct-002",
+    "Verdict": "PASS",
+    "Cases": "37/37",
+    "Fails": 0,
+    "SampleIssues": 0,
+    "Secs": 52.0,
+    "Err": ""
+  },
+  {
+    "Id": "dp/dp-008",
+    "Verdict": "PASS",
+    "Cases": "36/36",
+    "Fails": 0,
+    "SampleIssues": 1,
+    "Secs": 65.0,
+    "Err": ""
+  },
+  {
+    "Id": "dp/dp-009",
+    "Verdict": "PASS",
+    "Cases": "37/37",
+    "Fails": 0,
+    "SampleIssues": 1,
+    "Secs": 67.0,
+    "Err": ""
+  },
+  {
+    "Id": "dp/dp-011",
+    "Verdict": "PASS",
+    "Cases": "35/35",
+    "Fails": 0,
+    "SampleIssues": 0,
+    "Secs": 78.0,
+    "Err": ""
+  },
+  {
+    "Id": "graph/graph-004",
+    "Verdict": "PASS",
+    "Cases": "34/34",
+    "Fails": 0,
+    "SampleIssues": 0,
+    "Secs": 62.0,
+    "Err": ""
+  },
+  {
+    "Id": "graph/graph-006",
+    "Verdict": "PASS",
+    "Cases": "36/36",
+    "Fails": 0,
+    "SampleIssues": 0,
+    "Secs": 127.0,
+    "Err": ""
+  },
+  {
+    "Id": "greedy/greedy-001",
+    "Verdict": "PASS",
+    "Cases": "34/34",
+    "Fails": 0,
+    "SampleIssues": 0,
+    "Secs": 65.0,
+    "Err": ""
+  },
+  {
+    "Id": "greedy/greedy-002",
+    "Verdict": "PASS",
+    "Cases": "34/34",
+    "Fails": 0,
+    "SampleIssues": 1,
+    "Secs": 61.0,
+    "Err": ""
+  },
+  {
+    "Id": "greedy/greedy-014",
+    "Verdict": "PASS",
+    "Cases": "40/40",
+    "Fails": 0,
+    "SampleIssues": 0,
+    "Secs": 124.0,
+    "Err": ""
+  },
+  {
+    "Id": "math/math-001",
+    "Verdict": "PASS",
+    "Cases": "38/38",
+    "Fails": 0,
+    "SampleIssues": 0,
+    "Secs": 142.0,
+    "Err": ""
+  },
+  {
+    "Id": "math/math-003",
+    "Verdict": "PASS",
+    "Cases": "32/32",
+    "Fails": 0,
+    "SampleIssues": 1,
+    "Secs": 66.0,
+    "Err": ""
+  },
+  {
+    "Id": "string/string-002",
+    "Verdict": "PASS",
+    "Cases": "37/37",
+    "Fails": 0,
+    "SampleIssues": 0,
+    "Secs": 68.0,
+    "Err": ""
+  }
+]

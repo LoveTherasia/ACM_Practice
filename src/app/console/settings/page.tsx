@@ -24,6 +24,12 @@ type TrainingStats = {
   advice: string;
 };
 
+type SandboxStatus = {
+  available: boolean;
+  image: string;
+  error: string | null;
+};
+
 type Provider = "openai" | "anthropic" | "opencode";
 
 type Preset = {
@@ -157,6 +163,7 @@ export default function SettingsPage() {
   const [message, setMessage] = useState<string | null>(null);
   const [messageKind, setMessageKind] = useState<"ok" | "err">("ok");
   const [training, setTraining] = useState<TrainingStats | null>(null);
+  const [sandbox, setSandbox] = useState<SandboxStatus | null>(null);
 
   const notify = (kind: "ok" | "err", text: string) => {
     setMessageKind(kind);
@@ -200,6 +207,17 @@ export default function SettingsPage() {
       }
     })();
   }, [load]);
+
+  useEffect(() => {
+    void (async () => {
+      try {
+        const response = await fetch("/api/settings/sandbox");
+        if (response.ok) setSandbox((await response.json()) as SandboxStatus);
+      } catch {
+        // Informational only; judging still fails closed server-side.
+      }
+    })();
+  }, []);
 
   const preset = PRESETS.find((p) => p.id === presetId) ?? PRESETS[0]!;
   /**
@@ -602,6 +620,23 @@ export default function SettingsPage() {
           ) : null}
         </section>
       </div>
+
+      <section className="mt-12 rounded-lg border border-line bg-sunken p-6">
+        <h2 className="text-lg font-semibold leading-snug tracking-normal text-ink">
+          代码执行沙箱
+        </h2>
+        <p className="mt-2 max-w-[70ch] text-sm leading-relaxed text-muted">
+          生成器、标程、checker 和用户提交都只在 Docker 隔离容器中运行；Docker
+          不可用时系统会拒绝执行，不会回退到宿主机。
+        </p>
+        {sandbox ? (
+          <p className={`mt-4 text-sm ${sandbox.available ? "text-pass" : "text-fail"}`}>
+            {sandbox.available
+              ? `沙箱已就绪：${sandbox.image}`
+              : `沙箱不可用：${sandbox.error ?? "请启动 Docker 并运行 npm run sandbox:build"}`}
+          </p>
+        ) : null}
+      </section>
 
       {/* Local-model training panel */}
       <section className="mt-12 rounded-lg border border-line bg-sunken p-6">

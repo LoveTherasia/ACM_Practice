@@ -7,7 +7,11 @@ import {
   readWorkspaceFile,
 } from "@/lib/problems/store";
 import { llmConfigured } from "@/lib/llm/provider";
-import { verifyWorkspace, dropMissingSolutionEntries } from "@/lib/problems/workspace";
+import {
+  verifyWorkspace,
+  dropMissingSolutionEntries,
+  checkSamplesAgainstSolutions,
+} from "@/lib/problems/workspace";
 
 export const dynamic = "force-dynamic";
 export const maxDuration = 900;
@@ -105,9 +109,18 @@ export async function POST(
     // such entry while parsing the config, so without this reconcile the
     // button would fail identically on every click, forever.
     await dropMissingSolutionEntries(problemId);
+
+    // Re-verification must apply the same sample discipline as generation,
+    // otherwise a hand-fixed statement can never be confirmed. Reported
+    // alongside the verifier's own verdict because it is invisible to the
+    // verifier, which never opens the statement.
+    const sampleProblems = await checkSamplesAgainstSolutions(problemId).catch(
+      () => [],
+    );
+
     const verification = await verifyWorkspace(problemId);
     await patchMeta(problemId, { verification });
-    return NextResponse.json({ verification });
+    return NextResponse.json({ verification, sampleProblems });
   } catch (error) {
     return NextResponse.json(
       { error: (error as Error).message },

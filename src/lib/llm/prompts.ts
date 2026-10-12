@@ -230,6 +230,10 @@ ${SHARED}
   一句话说明这个点覆盖矩阵里的哪一格。没有 coverage 的 case 不写。
 - **type 是类别名，不带编号**：写 "sample" 而不是 "sample-1"；编号区分放在 name 里（sample-1、sample-2）。
   同一类 type 可以对应多个不同 seed 的 case。
+- **题面有几组样例，就要有几个 \`type: "sample"\` 的 case，一一对应。**
+  你写的题面里每一组 \`\`\`inputN\`\`\` 都必须在 config 里有对应的 sample case，
+  顺序与编号一致（\`input1\` → \`sample-1\`）。不要把样例数量写少：
+  sample case 是验题环节唯一能核对"题面与数据是否描述同一道题"的依据。
 - solutions 条目用 **role** 字段（main / reference），不是 tag。
 - wrongSolutions 条目用 **expected** 字段（fail / pass / observe）。
 - 交互题：checker 为 null，interactor 为 "src/checker/interactor.cpp"；普通题相反。
@@ -395,6 +399,31 @@ ${SHARED}
   历史上最典型的一类失败就是这里：题面第一行写 "n m" 两个数，
   generator 只输出 m，validator 则按 n 再读 m，于是每个点都报格式错误。
   **写完之后回到题面的输入格式，逐行数一遍行数与每行字段数。**
+- **\`type == "sample"\` 必须逐字输出题面里声明的那组样例输入。**
+  这是本题唯一一处必须**确定性**构造数据的分支，**绝对不能用随机数**：
+
+  \`\`\`cpp
+  if (type == "sample") {
+      // 逐字复刻 docs/statement.md 里 \`\`\`input1 的内容
+      printf("3\\n");
+      printf("3 1 2\\n");
+      return 0;
+  }
+  \`\`\`
+
+  要求：
+  - **一个 sample 分支对应题面的一组样例**。config 里有 \`sample-1\`、\`sample-2\`
+    就必须分别输出题面的 \`input1\`、\`input2\`；用 \`seed\` 或 \`name\` 区分，
+    不要两组样例都走同一个分支输出同一份数据。
+  - 数值、行数、空格、换行都要与题面**逐字节一致**。题面样例是给选手看的，
+    也是验题环节唯一能用来核对"题面与数据是否描述同一道题"的依据。
+  - 若样例数多于 sample case 数，宁可多留几个 sample case，也不要漏掉任何一组样例。
+
+  实测事故：多个 generator 没有实现 \`sample\`，该类型落到兜底分支生成了
+  **随机数据**（题面写 \`3 / 3 1 2\`，实际数据是 151 个随机数）。
+  后果是**题面的样例从未被验题验证过**——\`.ans\` 是随机数据的答案，
+  于是题面与数据可以完全脱节（有一道题题面两处样例自相矛盾、一处写答案 2
+  一处写 0，却依然"通过"了 32/32 验题），最终交付了一道废题。
 - 用 testlib 随机数（rnd.next(lo, hi)），registerGen(argc, argv, 1) 后 rnd.setSeed(seed)。
 - 在 generator.cpp 的文件头注释里写清每个 case type 的构造意图。
 - **在 generator.cpp 第一行写一条机器可读的 type 清单**，格式固定：
@@ -497,7 +526,10 @@ ${OUTPUT_PROTOCOL}
    Worker: solutions / tutorial
    ------------------------------------------------------------------------ */
 
-export function solutionsTutorialSystem(brief: PipelineBrief): string {
+export function solutionsTutorialSystem(
+  brief: PipelineBrief,
+  codeStyle = "",
+): string {
   const detail =
     brief.difficulty === "简单"
       ? "简短直接，讲清做法和复杂度即可。"
@@ -518,12 +550,21 @@ ${SHARED}
 
 **不要输出 solution.py**——本流水线只验证 C++ 解法，Python 参考解不参与验题。
 
+${codeStyle}
+
 ## 标程写法
 
 - solution.cpp 要精简，去掉与本题无关的大模板、无用 define、无用工具函数，
   并且是最标准、最适合作为主标程的实现。
+  （注意：这与上面的"逐字复制模板"不冲突——模板提供头部与辅助函数，
+  \`solve()\` 内部只写本题真正需要的逻辑，不要塞入本题用不到的工具函数。）
 - solution2.cpp 必须在思路或关键实现上独立，能用于交叉验证；
   不要只是把变量名换一遍。
+- **两份标程必须按题面语义实现，不能实现一个"更简单但不同"的问题。**
+  实测出现过这种事故：题面要求 \`n - max_x count(x | a_i)\`，
+  而两份标程都写成 \`n - 不同值个数\`——数据由同一批错标程生成，
+  于是验题 32/32 全过，但题目实际是废的。
+  写完后请回读题面，确认你算的量与题面定义的量**是同一个量**。
 - 复杂度必须符合主 agent 设定的目标。
 - 交互题读到 -1 后立即退出，不要继续读写。
 - 递归深度风险：若树可能退化成链、搜索深度很深，检查栈假设是否明确；

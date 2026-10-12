@@ -9,6 +9,8 @@
     "start": "next start",
     "lint": "eslint",
     "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "sandbox:build": "docker build -t acm-practice-sandbox:1 ./sandbox",
     "verify": "powershell -ExecutionPolicy Bypass -File ./skills/icpc-problem-creator/scripts/run-all-tests.ps1"
   },
   "dependencies": {
@@ -36,7 +38,8 @@
     "eslint-config-next": "^15.5.0",
     "postcss": "^8.5.0",
     "tailwindcss": "^4.3.0",
-    "typescript": "^5.9.0"
+    "typescript": "^5.9.0",
+    "vitest": "^3.2.7"
   },
   "engines": {
     "node": ">=20.9.0"

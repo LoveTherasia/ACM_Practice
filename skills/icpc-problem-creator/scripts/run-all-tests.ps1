@@ -2,7 +2,8 @@
 
 [CmdletBinding()]
 param(
-    [string[]]$Workspace
+    [string[]]$Workspace,
+    [string]$ArtifactRoot
 )
 
 # Emit UTF-8 on stdout.
@@ -27,8 +28,19 @@ try {
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+# This script compiles and executes generated C++/Python programs. It is not a
+# security boundary by itself and therefore refuses direct host execution. The
+# Next.js app invokes it only from the locked-down Docker image with this marker.
+if ($env:ACM_SANDBOX -ne "1") {
+    throw "拒绝在宿主机直接运行验题脚本。请启动 Docker 并通过应用的安全沙箱执行。"
+}
+
 $repoRoot = Split-Path -Parent $PSScriptRoot
-$artifactRoot = Join-Path $repoRoot ".codex-test-artifacts"
+$artifactRoot = if ([string]::IsNullOrWhiteSpace($ArtifactRoot)) {
+    Join-Path $repoRoot ".codex-test-artifacts"
+} else {
+    [System.IO.Path]::GetFullPath($ArtifactRoot)
+}
 $script:IsWindowsHost = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Windows)
 $script:Failures = [System.Collections.Generic.List[object]]::new()
 
@@ -559,7 +571,11 @@ function Test-OneWorkspace {
                     continue
                 }
 
-                [System.IO.File]::WriteAllText($referenceOut, $referenceResult.Stdout, [System.Text.UTF8Encoding]::new($false))
+                # Same CRLF normalisation as the main solution: a reference
+                # solution may also emit \r\n on Windows, and the checker's
+                # strict EOF/EOLN reads would reject it.
+                $normalisedReferenceOut = $referenceResult.Stdout -replace "`r`n", "`n"
+                [System.IO.File]::WriteAllText($referenceOut, $normalisedReferenceOut, [System.Text.UTF8Encoding]::new($false))
                 $judgeResult = Invoke-External -RepoRoot $repoRoot -FilePath $judgePath -Arguments @($caseInfo.InputPath, $referenceOut, $caseInfo.AnswerPath) -WorkingDirectory $problem.WorkspacePath -TimeoutMs 10000
                 if ($judgeResult.TimedOut -or $judgeResult.ExitCode -ne 0) {
                     $message = "参考解未通过 checker：solution=$($reference.Name), case=$($caseInfo.Name)"
@@ -586,7 +602,11 @@ function Test-OneWorkspace {
                     }
                     continue
                 }
-                [System.IO.File]::WriteAllText($wrongOut, $wrongResult.Stdout, [System.Text.UTF8Encoding]::new($false))
+                # Same CRLF normalisation as the main solution: a wrong
+                # solution may also emit \r\n on Windows, and the checker's
+                # strict EOF/EOLN reads would reject it.
+                $normalisedWrongOut = $wrongResult.Stdout -replace "`r`n", "`n"
+                [System.IO.File]::WriteAllText($wrongOut, $normalisedWrongOut, [System.Text.UTF8Encoding]::new($false))
                 $judgeResult = Invoke-External -RepoRoot $repoRoot -FilePath $judgePath -Arguments @($caseInfo.InputPath, $wrongOut, $caseInfo.AnswerPath) -WorkingDirectory $problem.WorkspacePath -TimeoutMs 10000
                 if ($judgeResult.TimedOut -or $judgeResult.ExitCode -ne 0) {
                     $failedCases += 1

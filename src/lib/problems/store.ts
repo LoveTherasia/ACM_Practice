@@ -14,6 +14,7 @@ import {
   type ProblemConfig,
   type ProblemMeta,
 } from "@/lib/problems/schema";
+import { removeProblemRecord } from "@/lib/problems/category";
 
 /**
  * Filesystem backed problem registry.
@@ -340,21 +341,9 @@ export async function deleteProblem(problemId: string): Promise<void> {
   const target = problemDir(problemId);
   await fs.rm(target, { recursive: true, force: true });
 
-  // Drop the index entry so the number becomes reusable.
+  // Drop the index entry under the same cross-process lock as allocation.
   try {
-    const indexPath = path.join(categoryDir(category), "index.json");
-    const raw = await fs.readFile(indexPath, "utf8");
-    const parsed = JSON.parse(raw) as {
-      problems?: { dir: string }[];
-    };
-    if (Array.isArray(parsed.problems)) {
-      parsed.problems = parsed.problems.filter((p) => p.dir !== dir);
-      await fs.writeFile(
-        indexPath,
-        `${JSON.stringify(parsed, null, 2)}\n`,
-        "utf8",
-      );
-    }
+    await removeProblemRecord(category, dir);
   } catch {
     // No index or unreadable: the directory removal is the important part.
   }
