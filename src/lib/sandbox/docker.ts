@@ -224,26 +224,41 @@ export async function runSandbox(
     "--cpus",
     String(options.cpus ?? 1),
     "--ulimit",
-    "nofile=64:64",
+    // 64 fd slots crash the .NET runtime inside pwsh (it cannot even load
+    // System.Console); 256 is still tight for abuse but roomy enough for
+    // PowerShell and g++ to start.
+    "nofile=256:256",
     "--ulimit",
     `nproc=${options.pidsLimit ?? 64}:${options.pidsLimit ?? 64}`,
     "--ulimit",
     "core=0:0",
+    // 64KB fsize kills g++ the moment it writes an object file (SIGXFSZ,
+    // "internal compiler error: File size limit exceeded"). The limit exists
+    // to stop unbounded file bombs, not to cap compiler output; 512MB is far
+    // above any legitimate artefact and far below filling the disk.
     "--ulimit",
-    "fsize=65536:65536",
+    "fsize=536870912:536870912",
     "--tmpfs",
     `/tmp:rw,noexec,nosuid,nodev,size=${options.tmpfsMb ?? 64}m`,
     "--user",
     "65534:65534",
     "-e",
     "ACM_SANDBOX=1",
+    // nobody's home (/nonexistent) does not exist, and PowerShell crashes
+    // at startup trying to create its config directory under it when the
+    // root filesystem is read-only. Point HOME at the writable tmpfs.
+    "-e",
+    "HOME=/tmp",
   ];
 
   for (const mount of options.mounts) {
+    // Docker 29 rejects a bare "rw" field in --mount (it wants key=value
+    // pairs only); writable is expressed by simply omitting the readonly
+    // flag, exactly like the CLI does for `docker run -v`.
     dockerArgs.push(
       "--mount",
-      `type=bind,source=${path.resolve(mount.hostPath)},target=${mount.containerPath},${
-        mount.readOnly ? "readonly" : "rw"
+      `type=bind,source=${path.resolve(mount.hostPath)},target=${mount.containerPath}${
+        mount.readOnly ? ",readonly" : ""
       }`,
     );
   }

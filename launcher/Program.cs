@@ -121,6 +121,97 @@ static class Program
         int port = FindFreePort(3210) ?? FindFreePort(3000) ?? 3210;
         debug("选定端口: " + port);
 
+        // ---- Docker sandbox environment ----
+        // The verification pipeline refuses to run generated code on the
+        // host (fail-closed), so without a working sandbox the console can
+        // still start but every generation fails at the verify stage. Best
+        // effort: detect Docker, start Docker Desktop when merely stopped,
+        // build the sandbox image when missing. None of this is fatal for
+        // the launcher itself - the server starts in parallel.
+        string docker = FindDocker();
+        debug("docker 路径: " + (docker ?? "(未找到)"));
+        if (docker == null)
+        {
+            MessageBox.Show(
+                "未检测到 Docker。出题流水线的安全沙箱需要 Docker 才能运行验题，\n" +
+                "当前可以启动控制台，但生成题目会在验题阶段失败。\n\n" +
+                "请安装 Docker Desktop：https://www.docker.com/products/docker-desktop/",
+                "ACM Practice",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+        }
+        else
+        {
+            var sandboxForm = new ConsoleForm("正在准备 Docker 沙箱环境…");
+            var sandboxThread = new Thread(() =>
+            {
+                try
+                {
+                    // The CLI exists but the engine may be down (Docker
+                    // Desktop not started). Probe `docker info`; on failure
+                    // try to launch Docker Desktop and wait for the engine.
+                    if (!DockerEngineReady(docker))
+                    {
+                        sandboxForm.AppendLine("Docker 引擎未运行，正在启动 Docker Desktop…");
+                        string desktop = FindDockerDesktop();
+                        debug("Docker Desktop: " + (desktop ?? "(未找到)"));
+                        if (desktop == null)
+                        {
+                            sandboxForm.Finish("未找到 Docker Desktop，无法自动启动引擎。请手动启动后重试。");
+                            return;
+                        }
+                        try
+                        {
+                            Process.Start(new ProcessStartInfo(desktop) { UseShellExecute = true });
+                        }
+                        catch (Exception ex)
+                        {
+                            sandboxForm.Finish("启动 Docker Desktop 失败: " + ex.Message);
+                            return;
+                        }
+                        if (!WaitForDockerEngine(docker, 180000))
+                        {
+                            sandboxForm.Finish("等待 Docker 引擎就绪超时（3 分钟）。请确认 Docker Desktop 已启动。");
+                            return;
+                        }
+                        sandboxForm.AppendLine("Docker 引擎已就绪。");
+                    }
+                    else
+                    {
+                        sandboxForm.AppendLine("Docker 引擎已在运行。");
+                    }
+
+                    // The sandbox image is local-only; build it when missing.
+                    if (!SandboxImageExists(docker))
+                    {
+                        sandboxForm.AppendLine("首次运行：正在构建沙箱镜像 acm-practice-sandbox:1…");
+                        string dockerfileDir = Path.Combine(root, "sandbox");
+                        if (!Directory.Exists(dockerfileDir))
+                        {
+                            sandboxForm.Finish("未找到 sandbox/ 目录，无法构建沙箱镜像。");
+                            return;
+                        }
+                        int code = RunDocker(docker, "build -t acm-practice-sandbox:1 \"" + dockerfileDir + "\"", root, 600000);
+                        sandboxForm.Finish(code == 0
+                            ? "沙箱镜像构建完成。"
+                            : "沙箱镜像构建失败，请手动运行 npm run sandbox:build 查看错误。");
+                    }
+                    else
+                    {
+                        sandboxForm.Finish("沙箱镜像已存在，环境就绪。");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    debug("沙箱准备异常: " + ex);
+                    sandboxForm.Finish("沙箱环境准备异常: " + ex.Message);
+                }
+            });
+            sandboxThread.IsBackground = true;
+            sandboxThread.Start();
+            // Deliberately NOT waiting: the console UI works without the
+            // sandbox and the settings page shows its live status.
+        }
         var serverForm = new ConsoleForm(null);
         var serverThread = new Thread(() =>
         {
@@ -218,6 +309,137 @@ static class Program
         return 0;
     }
 
+
+    // ---- Docker helpers ----
+
+    /// Find docker.exe: PATH first, then the standard Docker Desktop
+    /// install locations, then common non-default drives (D:, E:, ...).
+    /// Returns null when Docker is not installed.
+    static string FindDocker()
+    {
+        string onPath = FindOnPath("docker.exe");
+        if (onPath != null) return onPath;
+        List<string> candidates = new List<string>
+        {
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), @"Docker\Docker\resources\bin\docker.exe"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"Docker\resources\bin\docker.exe"),
+        };
+        // Docker Desktop allows a custom install drive; scan fixed drives
+        // for the "<drive>:\Docker\resources\bin" layout.
+        foreach (string drive in Directory.GetLogicalDrives())
+        {
+            candidates.Add(Path.Combine(drive, @"Docker\resources\bin\docker.exe"));
+        }
+        foreach (string candidate in candidates)
+        {
+            try { if (File.Exists(candidate)) return candidate; } catch { }
+        }
+        return null;
+    }
+
+    /// The Docker Desktop GUI executable, used to start the engine when the
+    /// CLI is installed but the engine is down.
+    static string FindDockerDesktop()
+    {
+        List<string> candidates = new List<string>
+        {
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), @"Docker\Docker\Docker Desktop.exe"),
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), @"Docker\Docker Desktop.exe"),
+        };
+        // Custom install drive: "<drive>:\Docker\Docker Desktop.exe".
+        foreach (string drive in Directory.GetLogicalDrives())
+        {
+            candidates.Add(Path.Combine(drive, @"Docker\Docker Desktop.exe"));
+        }
+        foreach (string candidate in candidates)
+        {
+            try { if (File.Exists(candidate)) return candidate; } catch { }
+        }
+        return null;
+    }
+
+    /// True when the Docker engine answers `docker info` (exit 0).
+    static bool DockerEngineReady(string docker)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = docker,
+                Arguments = "info --format {{.ServerVersion}}",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            };
+            var p = Process.Start(psi);
+            p.StandardOutput.ReadToEnd();
+            p.StandardError.ReadToEnd();
+            p.WaitForExit(15000);
+            return p.ExitCode == 0;
+        }
+        catch { return false; }
+    }
+
+    /// Poll the engine until it answers or the timeout expires. Docker
+    /// Desktop can take over a minute to start on a cold boot.
+    static bool WaitForDockerEngine(string docker, int timeoutMs)
+    {
+        var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+        while (DateTime.UtcNow < deadline)
+        {
+            if (DockerEngineReady(docker)) return true;
+            Thread.Sleep(3000);
+        }
+        return false;
+    }
+
+    /// True when the local sandbox image has already been built.
+    static bool SandboxImageExists(string docker)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = docker,
+                Arguments = "image inspect acm-practice-sandbox:1",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+            };
+            var p = Process.Start(psi);
+            p.StandardOutput.ReadToEnd();
+            p.StandardError.ReadToEnd();
+            p.WaitForExit(15000);
+            return p.ExitCode == 0;
+        }
+        catch { return false; }
+    }
+
+    /// Run one docker command to completion with a timeout.
+    static int RunDocker(string docker, string args, string cwd, int timeoutMs)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = docker,
+                Arguments = args,
+                WorkingDirectory = cwd,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            };
+            var p = Process.Start(psi);
+            if (!p.WaitForExit(timeoutMs))
+            {
+                try { p.Kill(); } catch { }
+                return -1;
+            }
+            return p.ExitCode;
+        }
+        catch { return -1; }
+    }
     static string FindOnPath(string name)
     {
         var pathVar = Environment.GetEnvironmentVariable("PATH") ?? "";

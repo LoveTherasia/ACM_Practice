@@ -113,14 +113,37 @@ export async function POST(request: Request) {
     );
   }
 
-  const source = ideaText ?? reply;
-  const tags = /tags:\s*(.+)/i.exec(source)?.[1]?.trim() ?? "";
-  const title = source.split(/\r?\n/).find((line) => line.trim() !== "")?.trim() ?? "";
-  const body = source.replace(tags, "").trim();
+  const source = (ideaText ?? reply).trim();
+
+  // Models are creative about Markdown even though the prompt asks for a
+  // simple title + body + tags format. Parse the tags line first, then strip
+  // headings and the tags fence so the generated premise never contains its
+  // own title or a dangling ``tags:`` block.
+  const tagsMatch = /(?:^|\n)\s*`{0,3}\s*tags\s*:\s*(.*?)\s*`{0,3}\s*(?=\n|$)/i.exec(
+    source,
+  );
+  const tags = tagsMatch?.[1]?.trim() ?? "";
+  const withoutTags = source
+    .replace(/```(?:text|markdown)?/gi, "")
+    .replace(/(?:^|\n)\s*tags\s*:\s*.*?(?=\n|$)/gi, "")
+    .trim();
+  const lines = withoutTags.split(/\r?\n/);
+  const titleIndex = lines.findIndex((line) => line.trim() !== "");
+  const rawTitle =
+    titleIndex >= 0 ? (lines[titleIndex] ?? "").trim() : "未命名题目";
+  const title = rawTitle
+    .replace(/^#{1,6}\s*/, "")
+    .replace(/^(?:标题|题目名称)\s*[:：]\s*/i, "")
+    .trim();
+  const body = lines
+    .slice(titleIndex >= 0 ? titleIndex + 1 : 0)
+    .join("\n")
+    .replace(/^\s*(?:idea\s*说明|思路说明)\s*[:：]?\s*/i, "")
+    .trim();
 
   return NextResponse.json({
     title,
-    premise: body,
+    premise: body || title,
     tags: tags
       ? tags
           .split(/[,，、]/)

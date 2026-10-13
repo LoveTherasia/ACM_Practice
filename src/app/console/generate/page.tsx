@@ -1,10 +1,11 @@
 "use client";
 
-import { CaretDown, Sparkle, SpinnerGap } from "@phosphor-icons/react";
+import { CaretDown, Sparkle, SpinnerGap, X } from "@phosphor-icons/react";
 import Link from "next/link";
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 
 import { CATEGORIES } from "@/lib/problems/categories";
+import { TAG_GROUPS } from "@/lib/problems/tags";
 import { STAGES } from "@/lib/pipeline/stages";
 import type { PipelineEvent, } from "@/lib/llm/orchestrate";
 import type {
@@ -44,7 +45,10 @@ export default function GeneratePage() {
     "中档",
   );
   const [interactive, setInteractive] = useState(false);
-  const [tags, setTags] = useState("");
+  /** Selected fine-grained tags, e.g. ["最短路", "最小生成树"]. */
+  const [selectedTags, setSelectedTags] = useState<string[]>([]);
+  /** Whether the tag picker popover is open. */
+  const [tagPickerOpen, setTagPickerOpen] = useState(false);
 
   const [running, setRunning] = useState(false);
   const [connected, setConnected] = useState(false);
@@ -56,6 +60,7 @@ export default function GeneratePage() {
   /** Brainstorm loading state (taste-skill 4.5: full interactive cycles). */
   const [ideating, setIdeating] = useState(false);
   const [ideaNotice, setIdeaNotice] = useState<string | null>(null);
+  const [ideaError, setIdeaError] = useState<string | null>(null);
 
   /** Pipeline error, mirrored into the progress panel so it is visible
    *  even when the form column is scrolled out of view. */
@@ -119,11 +124,7 @@ export default function GeneratePage() {
           premise: premise.trim(),
           difficulty,
           interactive,
-          tags: tags
-            .split(/[,，、\s]+/)
-            .map((t) => t.trim())
-            .filter(Boolean)
-            .slice(0, 8),
+          tags: selectedTags.slice(0, 8),
         }),
       });
 
@@ -197,38 +198,58 @@ export default function GeneratePage() {
   const brainstorm = async () => {
     setIdeating(true);
     setIdeaNotice(null);
+    setIdeaError(null);
     setError(null);
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 180_000);
     try {
       const response = await fetch("/api/idea", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          topic: tags.trim() || undefined,
+          topic: selectedTags.length > 0 ? selectedTags.join("、") : undefined,
         }),
+        signal: controller.signal,
       });
       if (!response.ok) {
         const payload = (await response.json().catch(() => null)) as
           | { error?: string }
           | null;
-        setError(payload?.error ?? `请求失败 HTTP ${response.status}`);
+        const message = payload?.error ?? `请求失败 HTTP ${response.status}`;
+        setIdeaError(message);
         return;
       }
-      const idea = (await response.json()) as {
+      const idea = (await response.json()) as Partial<{
         title: string;
         premise: string;
         tags: string[];
-      };
-      setPremise(idea.premise);
+      }>;
+      if (
+        typeof idea.title !== "string" ||
+        typeof idea.premise !== "string" ||
+        idea.premise.trim().length < 8
+      ) {
+        throw new Error("模型返回的 idea 格式不完整，请重试。");
+      }
+      setPremise(idea.premise.trim());
       // Tags stay untouched: the user's own direction (if any) is the input,
       // and the idea's suggested tags are shown in the notice instead of
       // overwriting what the user typed.
+      const suggestedTags = Array.isArray(idea.tags) ? idea.tags : [];
       setIdeaNotice(
-        `已生成 idea「${idea.title}」，已填入下方，可自行修改。` +
-          (idea.tags.length > 0 ? `建议方向：${idea.tags.join("、")}` : ""),
+        `已生成「${idea.title}」，已填入下方，可自行修改。` +
+          (suggestedTags.length > 0
+            ? `建议方向：${suggestedTags.join("、")}`
+            : ""),
       );
     } catch (e) {
-      setError((e as Error).message);
+      const message =
+        e instanceof DOMException && e.name === "AbortError"
+          ? "构思请求超过 3 分钟仍未返回，请检查模型配置后重试。"
+          : (e as Error).message;
+      setIdeaError(message);
     } finally {
+      window.clearTimeout(timeout);
       setIdeating(false);
     }
   };
@@ -236,17 +257,24 @@ export default function GeneratePage() {
   const stageByRole = new Map(stages.map((s) => [s.role, s]));
 
   return (
-    <div className="mx-auto max-w-[1400px] px-4 py-10 sm:px-6 lg:px-8">
-      <h1 className="text-2xl font-semibold leading-tight tracking-normal text-ink">
-        造题
-      </h1>
-      <p className="mt-1 text-sm text-muted">
-        给出一个 idea，流水线会生成完整题目工作区并跑通本地验题。整个过程可能需要几分钟。
-      </p>
+    <div className="mx-auto max-w-[1400px] px-4 pb-16 pt-8 sm:px-6 lg:px-8 lg:pt-12">
+      <header className="grid gap-8 border-b border-line pb-10 lg:grid-cols-[1fr_0.72fr] lg:items-end">
+        <div>
+          <p className="font-mono text-[11px] uppercase tracking-[0.18em] text-accent-text">
+            Problem studio / generation
+          </p>
+          <h1 className="mt-3 max-w-[12ch] text-4xl font-semibold leading-[1.05] tracking-[-0.04em] text-ink md:text-5xl">
+            从一个想法，长出一整道题
+          </h1>
+        </div>
+        <p className="max-w-[48ch] text-sm leading-7 text-muted">
+          先把想考的机制说清楚。流水线会生成题面、题解、标程、数据与判题器，随后在本地沙箱里逐项验证。
+        </p>
+      </header>
 
       <div className="mt-8 grid min-w-0 gap-8 lg:grid-cols-[0.9fr_1.1fr]">
         {/* ---------------- Form ---------------- */}
-        <section className="min-w-0 rounded-lg border border-line bg-surface p-6 shadow-card">
+        <section className="min-w-0 rounded-2xl border border-line bg-raised p-6 shadow-card md:p-8">
           <div className="flex flex-col gap-2">
             <label htmlFor="category" className="text-sm font-medium text-ink">
               题型分类
@@ -280,9 +308,14 @@ export default function GeneratePage() {
           </div>
 
           <div className="mt-6 flex flex-col gap-2">
-            <label htmlFor="premise" className="text-sm font-medium text-ink">
-              核心 idea
-            </label>
+            <div className="flex items-baseline justify-between gap-3">
+              <label htmlFor="premise" className="text-sm font-medium text-ink">
+                核心 idea
+              </label>
+              <span className="font-mono text-[11px] text-subtle">
+                {premise.length}/4000
+              </span>
+            </div>
             <textarea
               id="premise"
               value={premise}
@@ -303,7 +336,7 @@ export default function GeneratePage() {
                 onClick={brainstorm}
                 disabled={running || ideating}
                 aria-busy={ideating}
-                className="inline-flex items-center gap-1.5 rounded-md border border-line-strong px-3 py-1.5 text-xs font-medium text-ink transition-colors duration-300 hover:bg-inset disabled:cursor-not-allowed disabled:opacity-60"
+                className="inline-flex items-center gap-1.5 rounded-full border border-line-strong px-3.5 py-1.5 text-xs font-medium text-ink transition-[background-color,transform] duration-200 hover:-translate-y-px hover:bg-inset active:translate-y-0 disabled:cursor-not-allowed disabled:opacity-60"
               >
                 {ideating ? (
                   <>
@@ -331,6 +364,11 @@ export default function GeneratePage() {
                 {ideaNotice}
               </p>
             ) : null}
+            {ideaError ? (
+              <p role="alert" className="rounded-md border border-fail/30 bg-fail/10 px-3 py-2 text-xs leading-relaxed text-fail">
+                {ideaError}
+              </p>
+            ) : null}
           </div>
 
           <div className="mt-6 flex flex-col gap-2">
@@ -356,19 +394,21 @@ export default function GeneratePage() {
           </div>
 
           <div className="mt-6 flex flex-col gap-2">
-            <label htmlFor="tags" className="text-sm font-medium text-ink">
-              方向标签（可选）
-            </label>
-            <input
-              id="tags"
-              value={tags}
-              onChange={(e) => setTags(e.target.value)}
-              placeholder="图论, 构造"
+            <span className="text-sm font-medium text-ink">方向标签（可选）</span>
+            <TagPicker
+              selected={selectedTags}
+              onChange={setSelectedTags}
+              open={tagPickerOpen}
+              setOpen={setTagPickerOpen}
               disabled={running}
-              className="rounded-md border border-line-strong bg-raised px-3 py-2 text-sm text-ink placeholder:text-subtle focus-ring"
+              highlightGroup={category}
             />
+            <p className="text-xs text-subtle">
+              {selectedTags.length > 0
+                ? `已选 ${selectedTags.length} 个标签，会作为期望方向发给模型。`
+                : "留空则不指定方向，由模型自由发挥。"}
+            </p>
           </div>
-
           <div className="mt-6 flex items-center gap-3">
             <input
               id="interactive"
@@ -387,7 +427,7 @@ export default function GeneratePage() {
             type="button"
             onClick={submit}
             disabled={!canSubmit}
-            className="mt-8 inline-flex w-full items-center justify-center gap-2 rounded-md bg-accent px-5 py-2.5 text-sm font-medium text-on-accent transition-transform duration-150 ease-[cubic-bezier(0.16,1,0.3,1)] active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-50"
+            className="mt-8 inline-flex w-full items-center justify-center gap-2 rounded-full bg-accent px-5 py-3 text-sm font-medium text-on-accent shadow-card transition-[background-color,transform] duration-200 hover:-translate-y-px hover:bg-accent/90 active:translate-y-0 active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-50"
           >
             {running ? (
               <>
@@ -508,6 +548,136 @@ export default function GeneratePage() {
           </div>
         </section>
       </div>
+    </div>
+  );
+}
+
+/**
+ * A grouped multi-select for fine-grained algorithm tags.
+ *
+ * Groups mirror the problem categories; the group matching the currently
+ * selected category is highlighted and sorted first so the most relevant
+ * tags are immediately visible. Clicking a tag toggles it; selected tags
+ * render as removable chips in the trigger row.
+ */
+function TagPicker({
+  selected,
+  onChange,
+  open,
+  setOpen,
+  disabled,
+  highlightGroup,
+}: {
+  selected: string[];
+  onChange: (next: string[]) => void;
+  open: boolean;
+  setOpen: (open: boolean) => void;
+  disabled?: boolean;
+  highlightGroup?: string;
+}) {
+  const toggle = (tag: string) => {
+    if (selected.includes(tag)) {
+      onChange(selected.filter((t) => t !== tag));
+    } else if (selected.length < 8) {
+      onChange([...selected, tag]);
+    }
+  };
+
+  const groups = useMemo(() => {
+    const sorted = [...TAG_GROUPS];
+    if (highlightGroup) {
+      sorted.sort((a, b) => {
+        const aHit = a.id === highlightGroup ? -1 : 0;
+        const bHit = b.id === highlightGroup ? -1 : 0;
+        return aHit - bHit;
+      });
+    }
+    return sorted;
+  }, [highlightGroup]);
+
+  return (
+    <div className="relative">
+      <button
+        type="button"
+        onClick={() => setOpen(!open)}
+        disabled={disabled}
+        aria-expanded={open}
+        className="flex min-h-[42px] w-full flex-wrap items-center gap-1.5 rounded-md border border-line-strong bg-raised px-3 py-1.5 text-left text-sm text-ink focus-ring disabled:cursor-not-allowed disabled:opacity-60"
+      >
+        {selected.length === 0 ? (
+          <span className="text-subtle">选择算法标签（可多选，留空随机）</span>
+        ) : (
+          selected.map((tag) => (
+            <span
+              key={tag}
+              className="inline-flex items-center gap-1 rounded-full bg-inset px-2.5 py-0.5 text-xs text-ink"
+            >
+              {tag}
+              <X
+                size={12}
+                role="button"
+                aria-label={`移除 ${tag}`}
+                className="cursor-pointer text-subtle hover:text-fail"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onChange(selected.filter((t) => t !== tag));
+                }}
+              />
+            </span>
+          ))
+        )}
+        <CaretDown
+          size={14}
+          aria-hidden
+          className={`pointer-events-none ml-auto shrink-0 text-subtle transition-transform ${open ? "rotate-180" : ""}`}
+        />
+      </button>
+
+      {open ? (
+        <div className="absolute z-20 mt-1 max-h-72 w-full overflow-y-auto rounded-md border border-line bg-raised p-3 shadow-card">
+          {groups.map((group) => (
+            <div key={group.id} className="mb-3 last:mb-0">
+              <p
+                className={`mb-1.5 text-xs font-medium ${
+                  group.id === highlightGroup ? "text-accent-text" : "text-muted"
+                }`}
+              >
+                {group.label}
+                {group.id === highlightGroup ? "（当前分类）" : ""}
+              </p>
+              <div className="flex flex-wrap gap-1.5">
+                {group.tags.map((tag) => {
+                  const active = selected.includes(tag);
+                  return (
+                    <button
+                      key={tag}
+                      type="button"
+                      onClick={() => toggle(tag)}
+                      aria-pressed={active}
+                      className={`rounded-full px-2.5 py-1 text-xs transition-colors duration-150 ${
+                        active
+                          ? "bg-accent text-on-accent"
+                          : "border border-line-strong text-muted hover:bg-inset hover:text-ink"
+                      }`}
+                    >
+                      {tag}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          ))}
+          {selected.length > 0 ? (
+            <button
+              type="button"
+              onClick={() => onChange([])}
+              className="mt-1 w-full rounded-md border border-line px-3 py-1.5 text-xs text-muted hover:bg-inset hover:text-ink"
+            >
+              清空全部标签
+            </button>
+          ) : null}
+        </div>
+      ) : null}
     </div>
   );
 }

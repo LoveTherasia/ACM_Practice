@@ -324,6 +324,15 @@ export async function checkGeneratorTypes(
     .filter((type) => !supported.has(type))
     .sort();
   if (missing.length === 0) {
+    // A declared list is only useful when unknown names cannot silently fall
+    // through to a default construction. Require an explicit rejection path;
+    // otherwise a future case typo can still produce valid but unintended data.
+    if (!/(?:quitf\s*\(\s*_fail|Unknown\s+case\s+type|unknown\s+case)/i.test(source)) {
+      return [
+        "### generator 声明了 SUPPORTED_TYPES，但没有显式拒绝未知 type",
+        "generator 必须在未知 case type 时调用 quitf(_fail, ...)，禁止使用静默兜底数据。",
+      ];
+    }
     return [];
   }
 

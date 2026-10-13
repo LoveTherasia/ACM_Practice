@@ -713,6 +713,22 @@ export async function preflightCompile(
   return problems;
 }
 
+/**
+ * The build tree is keyed by config.slug, which differs from the numbered
+ * problemId directory. Read it from the workspace's config.json; null when
+ * the config is unreadable (the copy is then simply skipped).
+ */
+async function readConfigSlug(problemId: string): Promise<string | null> {
+  try {
+    const raw = await fs.readFile(problemPath(problemId, "config.json"), "utf8");
+    const parsed = JSON.parse(raw) as { slug?: unknown };
+    return typeof parsed.slug === "string" && parsed.slug.trim() !== ""
+      ? parsed.slug
+      : null;
+  } catch {
+    return null;
+  }
+}
 /** Run the skill's verifier against one workspace and persist the transcript. */
 export async function verifyWorkspace(
   problemId: string,
@@ -761,14 +777,29 @@ export async function verifyWorkspace(
 
     // Judging consumes these artifacts later. Copy only the expected build
     // tree from the private mount, never anything written elsewhere.
-    const sourceBuild = path.join(artifacts, "build", problemId.split("/")[1] ?? "");
-    if (await exists(sourceBuild)) {
-      const destination = path.join(icpcSkillDir, ".codex-test-artifacts", "build", problemId.split("/")[1] ?? "");
-      await fs.rm(destination, { recursive: true, force: true });
-      await fs.mkdir(path.dirname(destination), { recursive: true });
-      await fs.cp(sourceBuild, destination, { recursive: true });
-    }
-    return {
+    //
+    // The build tree is keyed by the config's slug (e.g.
+    // "shortest-path-count-bottleneck"), NOT by the problemId's numbered
+    // directory (e.g. "greedy-017") - run-all-tests.ps1 names the build root
+    // after config.slug. Copying by problemId silently matched nothing, the
+    // generated data stayed in the scratch mount and was deleted with it,
+    // which is why the console reported "验题数据目录尚未生成" after a
+    // passing run.
+    const buildSlug = await readConfigSlug(problemId);
+    if (buildSlug) {
+      const sourceBuild = path.join(artifacts, "build", buildSlug);
+      if (await exists(sourceBuild)) {
+        const destination = path.join(
+          icpcSkillDir,
+          ".codex-test-artifacts",
+          "build",
+          buildSlug,
+        );
+        await fs.rm(destination, { recursive: true, force: true });
+        await fs.mkdir(path.dirname(destination), { recursive: true });
+        await fs.cp(sourceBuild, destination, { recursive: true });
+      }
+    }    return {
       code: sandbox.code,
       stdout: sandbox.stdout,
       stderr: sandbox.stderr,
