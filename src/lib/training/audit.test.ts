@@ -138,4 +138,48 @@ describe("dedupeDataset", () => {
       },
     );
   });
+
+  it("keeps retro-captured placeholders that share a prompt across problems", async () => {
+    // Every retro-captured sample carries the SAME generic prompt for a role,
+    // so a (role, user) identity made them collide and dedupe deleted whole
+    // problems (graph-graph-006 went from 3 samples to an empty file).
+    const placeholder = (role: string) =>
+      sample({ role, user: `(retro-captured: user brief for ${role})` });
+    await withScratchDataset(
+      [
+        placeholder("architect"),
+        placeholder("judge-validator"),
+        sample({ slug: "graph-graph-004", role: "architect", user: "(retro-captured: user brief for architect)" }),
+        sample({ slug: "graph-graph-004", role: "judge-validator", user: "(retro-captured: user brief for judge-validator)" }),
+      ],
+      async (dir) => {
+        const result = await dedupeDataset();
+        expect(result.removed).toBe(0);
+        const raw = await fs.readFile(
+          path.join(dir, "training", "dataset", "test.jsonl"),
+          "utf8",
+        );
+        expect(raw.trim().split("\n")).toHaveLength(4);
+        // And the audit no longer reports them as duplicates of each other.
+        const report = await auditDataset();
+        expect(report.duplicates.count).toBe(0);
+        expect(report.nearDuplicates.count).toBe(0);
+      },
+    );
+  });
+
+  it("still removes an exact placeholder re-captured for the same problem", async () => {
+    await withScratchDataset(
+      [
+        sample({ slug: "graph-graph-006", role: "architect", user: "(retro-captured: user brief for architect)", assistant: "a" }),
+        sample({ slug: "graph-graph-006", role: "architect", user: "(retro-captured: user brief for architect)", assistant: "a" }),
+      ],
+      async (dir) => {
+        const result = await dedupeDataset();
+        expect(result.removed).toBe(1);
+        const raw = await fs.readFile(path.join(dir, "training", "dataset", "test.jsonl"), "utf8");
+        expect(raw.trim().split("\n")).toHaveLength(1);
+      },
+    );
+  });
 });

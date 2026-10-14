@@ -24,12 +24,13 @@ import {
 } from "@/lib/problems/format";
 import { checkTreeData } from "@/lib/problems/tree-check";
 import { checkCaseDistinctness } from "@/lib/problems/case-distinctness";
+import { checkValidatorAcceptsGenerator } from "@/lib/problems/validator-check";
 import {
   problemConfigSchema,
   type ProblemConfig,
   type Verification,
 } from "@/lib/problems/schema";
-import { runSandbox, withSandboxScratch } from "@/lib/sandbox/docker";
+import { runSandbox, withSandboxScratch, isSandboxUnavailableError } from "@/lib/sandbox/docker";
 
 /**
  * Bridge to the vendored PowerShell toolchain.
@@ -435,6 +436,9 @@ export function parseVerification(
     passedCases,
     logPath: null,
     failures,
+    // Set by verifyWorkspace when the failure is an unavailable sandbox, not a
+    // problem defect; parseVerification itself can only see a transcript.
+    infrastructure: false,
   };
 }
 
@@ -474,6 +478,15 @@ function firstCrashLine(output: string): string | null {
     .filter((line) => CRASH_LINE.test(line));
   const last = lines[lines.length - 1];
   return last ? last.slice(0, 300) : null;
+}
+
+/** The first line that names the sandbox being unavailable. */
+function sandboxFailureLine(output: string): string | null {
+  const line = output
+    .split(/\r?\n/)
+    .map((l) => l.replace(/\u001b\[[0-9;]*m/g, "").trim())
+    .find((l) => isSandboxUnavailableError(l));
+  return line ? line.slice(0, 300) : null;
 }
 
 /* ---------------------------------------------------------------------------
@@ -608,61 +621,111 @@ export async function referenceRunner(
   };
 }
 
-/**
- * Run the generator once per case type to catch runtime-only defects.
- *
- * The compile preflight cannot see these: a generator whose `type == "..."`
- * branches do not cover the planned types compiles perfectly and then exits
- * with "FAIL unknown type sample" on every single case. Observed on dp-011,
- * where a repair round produced exactly that, and the verification run
- * reported 39 generate failures whose only content was the same one-line
- * cause repeated - information the model already had, at heavy token cost.
- *
- * Running the generator directly turns that into one precise diagnostic before
- * the expensive verification run. Any single case failing is enough: the
- * generator is shared by all cases, so one failure means all of them.
- */
-/**
- * Compile the generator once and run it for a given (type, seed) inside the
- * sandbox. Shared by the tree-data preflight; returns null when the compile
- * fails so callers can skip silently (the compile preflight reports that).
- */
-export async function sandboxedGeneratorRunner(
-  problemId: string,
-  config: ProblemConfig,
+/** Build the generator in `scratch` and bind a runner to it. */
+async function bindGenerator(
+  scratch: string,
+  source: string,
+  includeDir: string,
 ): Promise<((type: string, seed: number) => Promise<{ code: number; stdout: string } | null>) | null> {
-  const source = problemPath(problemId, config.generator.path);
-  if (!(await exists(source))) {
+  const build = await runSandbox({
+    command: "g++",
+    args: ["-std=gnu++20", "-O2", "-I/problem/include", "/problem/generator.cpp", "-o", "/work/generator"],
+    mounts: [
+      { hostPath: scratch, containerPath: "/work" },
+      { hostPath: source, containerPath: "/problem/generator.cpp", readOnly: true },
+      { hostPath: includeDir, containerPath: "/problem/include", readOnly: true },
+    ],
+    timeoutMs: 90_000,
+    memoryMb: 1024,
+    maxOutputBytes: 4 * 1024 * 1024,
+  }).catch(() => null);
+  if (!build || build.code !== 0) {
     return null;
   }
+  return async (type, seed) => {
+    const run = await runSandbox({
+      command: "/work/generator",
+      args: [type, String(seed)],
+      mounts: [{ hostPath: scratch, containerPath: "/work" }],
+      timeoutMs: 30_000,
+      memoryMb: 512,
+      maxOutputBytes: 16 * 1024 * 1024,
+    }).catch(() => null);
+    return run && run.code === 0 && !run.timedOut ? { code: run.code, stdout: run.stdout } : null;
+  };
+}
+
+/** Build the validator in `scratch` and bind a stdin runner to it. */
+async function bindValidator(
+  scratch: string,
+  source: string,
+  includeDir: string,
+): Promise<
+  ((input: string) => Promise<{ code: number; stderr: string; timedOut: boolean } | null>) | null
+> {
+  const build = await runSandbox({
+    command: "g++",
+    args: ["-std=gnu++20", "-O2", "-I/problem/include", "/problem/validator.cpp", "-o", "/work/validator"],
+    mounts: [
+      { hostPath: scratch, containerPath: "/work" },
+      { hostPath: source, containerPath: "/problem/validator.cpp", readOnly: true },
+      { hostPath: includeDir, containerPath: "/problem/include", readOnly: true },
+    ],
+    timeoutMs: 90_000,
+    memoryMb: 1024,
+    maxOutputBytes: 4 * 1024 * 1024,
+  }).catch(() => null);
+  if (!build || build.code !== 0) {
+    return null;
+  }
+  return async (input) => {
+    const run = await runSandbox({
+      command: "/work/validator",
+      mounts: [{ hostPath: scratch, containerPath: "/work" }],
+      input,
+      timeoutMs: 30_000,
+      memoryMb: 512,
+      maxOutputBytes: 4 * 1024 * 1024,
+    }).catch(() => null);
+    return run ? { code: run.code, stderr: run.stderr, timedOut: run.timedOut } : null;
+  };
+}
+
+/**
+ * Compile the generator and validator once each, hand both runners to `task`,
+ * and keep the scratch alive for the whole task.
+ *
+ * The scratch MUST outlive the runners: an earlier version returned a runner
+ * from inside withSandboxScratch, which deletes the scratch - and the compiled
+ * binary with it - the instant the factory resolves. Every later call then
+ * exec'd a missing file and returned null, so tree-check and case-distinctness
+ * silently probed nothing (`probed = 0`) and always reported success. Passing the
+ * runners to a callback ties their lifetime to the scratch correctly.
+ */
+export async function withSandboxedGeneratorAndValidator<T>(
+  problemId: string,
+  config: ProblemConfig,
+  task: (tools: {
+    runGenerator: ((type: string, seed: number) => Promise<{ code: number; stdout: string } | null>) | null;
+    runValidator: ((input: string) => Promise<{ code: number; stderr: string; timedOut: boolean } | null>) | null;
+  }) => Promise<T>,
+): Promise<T> {
   return withSandboxScratch(async (scratch) => {
     await fs.chmod(scratch, 0o777).catch(() => {});
-    const build = await runSandbox({
-      command: "g++",
-      args: ["-std=gnu++20", "-O2", "-I/problem/include", "/problem/generator.cpp", "-o", "/work/generator"],
-      mounts: [
-        { hostPath: scratch, containerPath: "/work" },
-        { hostPath: source, containerPath: "/problem/generator.cpp", readOnly: true },
-        { hostPath: problemPath(problemId, "include"), containerPath: "/problem/include", readOnly: true },
-      ],
-      timeoutMs: 90_000,
-      memoryMb: 1024,
-      maxOutputBytes: 4 * 1024 * 1024,
-    });
-    if (build.code !== 0) {
-      return null;
-    }
-    return async (type: string, seed: number) => {
-      const run = await runSandbox({
-        command: "/work/generator",
-        args: [type, String(seed)],
-        mounts: [{ hostPath: scratch, containerPath: "/work" }],
-        timeoutMs: 30_000,
-        memoryMb: 512,
-        maxOutputBytes: 16 * 1024 * 1024,
-      });
-      return run.code === 0 && !run.timedOut ? { code: run.code, stdout: run.stdout } : null;
-    };
+    const includeDir = problemPath(problemId, "include");
+
+    const generatorSource = problemPath(problemId, config.generator.path);
+    const runGenerator = (await exists(generatorSource))
+      ? await bindGenerator(scratch, generatorSource, includeDir)
+      : null;
+
+    const validatorSource = problemPath(problemId, config.validator);
+    const runValidator =
+      config.validator && (await exists(validatorSource))
+        ? await bindValidator(scratch, validatorSource, includeDir)
+        : null;
+
+    return task({ runGenerator, runValidator });
   });
 }
 
@@ -736,19 +799,50 @@ export async function preflightCompile(
     } catch {
       // No meta yet (first preflight): the statement fallback still applies.
     }
-    const runGenerator = await sandboxedGeneratorRunner(problemId, config).catch(() => null);
-    if (runGenerator) {
-      problems.push(
-        ...(await checkTreeData(problemId, config, runGenerator, metaTags).catch(() => [])),
-      );
-      // Every case type must produce distinct data: a generator whose
-      // dispatch is broken (e.g. numeric atoi vs string types) makes all
-      // cases identical, verification passes vacuously, and the declared
-      // coverage does not exist.
-      problems.push(
-        ...(await checkCaseDistinctness(problemId, config, runGenerator).catch(() => [])),
-      );
-    }
+
+    // The generator and validator are compiled once and reused by all runtime
+    // checks below, so the block costs two compiles plus a container run per
+    // probe. A failure of the block itself (sandbox down) is swallowed - the
+    // compile preflight and the verifier report that with better context.
+    await withSandboxedGeneratorAndValidator(
+      problemId,
+      config,
+      async ({ runGenerator, runValidator }) => {
+        if (!runGenerator) {
+          return;
+        }
+        // When the problem is a tree problem (declared via the 树 tag, falling
+        // back to an explicit statement guarantee), every generator branch must
+        // really produce a tree. Cycles or disconnected data pass the validator
+        // (it only checks counts/ranges) and only surface later as undefined-
+        // solution behaviour.
+        problems.push(
+          ...(await checkTreeData(problemId, config, runGenerator, metaTags).catch(() => [])),
+        );
+        // Every case type must produce distinct data: a generator whose
+        // dispatch is broken (e.g. numeric atoi vs string types) makes all
+        // cases identical, verification passes vacuously, and the declared
+        // coverage does not exist.
+        problems.push(
+          ...(await checkCaseDistinctness(problemId, config, runGenerator).catch(() => [])),
+        );
+        // The validator must ACCEPT what the generator emits. This is the link
+        // the preflight used to skip: template-001's generator printed the edge
+        // "4 1" (u > v) while its validator requires u_i < v_i, so every
+        // sample/format check passed and the failure only appeared after a full
+        // verification run.
+        if (runValidator) {
+          problems.push(
+            ...(await checkValidatorAcceptsGenerator(
+              problemId,
+              config,
+              runGenerator,
+              runValidator,
+            ).catch(() => [])),
+          );
+        }
+      },
+    ).catch(() => {});
   }
 
   // The statement's own samples against the generated data. This is the only
@@ -889,15 +983,48 @@ export async function verifyWorkspace(
       stderr: sandbox.stderr,
       output: `${sandbox.stdout}\n${sandbox.stderr}`,
     } satisfies RunResult;
+  }).catch((error: Error) => {
+    // requireSandbox threw before any container could start (Docker is down).
+    // Turn it into a transcript so it is logged like any other run instead of
+    // escaping as an exception the caller has to special-case.
+    if (!isSandboxUnavailableError(error.message)) {
+      throw error;
+    }
+    return {
+      code: 1,
+      stdout: "",
+      stderr: error.message,
+      output: error.message,
+    } satisfies RunResult;
   });
   let verification = parseVerification(problemId, result.output, result.code);
-
-  // A crash produces no failure lines, so the parsed report would read as
-  // "0 failures" while passed is false - and the repair loop would then be
-  // handed an empty digest, burn a model call, and change nothing (observed:
-  // two consecutive repair rounds that rewrote 0 files). Record the crash as
-  // the failure, so the digest and the console both say what actually happened.
-  if (!verification.passed && !reachedVerdict(result.output)) {
+  // Infrastructure failure: the sandbox never ran the problem. This is not a
+  // defect in the problem, so it is recorded with a distinct marker that the
+  // repair loop and the recycle report both recognise - otherwise a Docker
+  // outage looks like a fixable failure and burns model calls trying to fix
+  // code that was never the problem (graph-009 recorded exactly this as
+  // "[verifier-crash] Docker Desktop is unable to start").
+  if (!verification.passed && isSandboxUnavailableError(result.output)) {
+    const detail = sandboxFailureLine(result.output) ?? "未知错误";
+    verification = {
+      ...verification,
+      infrastructure: true,
+      failures: [
+        {
+          scope: "sandbox",
+          message:
+            `[sandbox-unavailable] 验题沙箱不可用（Docker Desktop 未运行或已停止），` +
+            `本次没有真正跑过题目，结果不代表题目对错。` +
+            `请启动 Docker Desktop 后重新验题。原始错误：${detail}`,
+        },
+      ],
+    };
+  } else if (!verification.passed && !reachedVerdict(result.output)) {
+    // A crash produces no failure lines, so the parsed report would read as
+    // "0 failures" while passed is false - and the repair loop would then be
+    // handed an empty digest, burn a model call, and change nothing (observed:
+    // two consecutive repair rounds that rewrote 0 files). Record the crash as
+    // the failure, so the digest and the console both say what actually happened.
     const crash = firstCrashLine(result.output) ?? "未知错误";
     verification = {
       ...verification,

@@ -185,6 +185,25 @@ export async function sandboxStatus(): Promise<{
   }
 }
 
+/**
+ * Whether a failure is the sandbox being unavailable rather than a defect in
+ * the problem under test.
+ *
+ * Docker Desktop not running, the daemon unreachable, or our own
+ * "安全沙箱不可用" guard all surface as an ordinary non-zero exit from the
+ * verifier. Without this they are indistinguishable from a real failure, and the
+ * repair loop then spends model calls trying to fix code that was never wrong
+ * (observed: graph-009 recorded "[verifier-crash] Docker Desktop is unable to
+ * start", which the loop would have treated as a fixable defect). Detecting the
+ * infrastructure case lets the pipeline stop instead of burning calls.
+ */
+const SANDBOX_UNAVAILABLE =
+  /Docker Desktop is unable to start|Cannot connect to the Docker daemon|error during connect|Is the docker daemon running|安全沙箱不可用|open \/\/\.\/pipe\/docker|docker_engine|The command '?docker'? could not be found|error getting credentials/i;
+
+export function isSandboxUnavailableError(text: string): boolean {
+  return text.trim() !== "" && SANDBOX_UNAVAILABLE.test(text);
+}
+
 function validateMount(mount: SandboxMount): void {
   if (!path.isAbsolute(mount.hostPath)) {
     throw new Error(`sandbox mount must be absolute: ${mount.hostPath}`);
@@ -206,6 +225,11 @@ export async function runSandbox(
   const dockerArgs = [
     "run",
     "--rm",
+    // `-i` keeps the container's STDIN open. Without it Docker wires STDIN to
+    // /dev/null and every byte written to the docker client's stdin is dropped:
+    // the in-sandbox validator, the reference-solution runner and the submit
+    // judge all read EOF instead of the input handed to runSandbox().
+    "-i",
     "--name",
     name,
     "--network",

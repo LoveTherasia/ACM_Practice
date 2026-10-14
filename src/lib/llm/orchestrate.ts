@@ -42,6 +42,7 @@ import {
   verifyWorkspace,
   writeGeneratedFiles,
 } from "@/lib/problems/workspace";
+import { isSandboxUnavailableError } from "@/lib/sandbox/docker";
 import { describeSampleSync, syncDeclaredSamples } from "@/lib/problems/samples";
 import { auditCoverage, summarizeCoverage } from "@/lib/problems/coverage";
 import { codeStylePromptBlock, styleSkillDir } from "@/lib/llm/style";
@@ -1536,12 +1537,38 @@ export async function runPipeline(
         try {
           verification = await verifyWorkspace(problemId);
         } catch (error) {
-          advance("verifier", "failed", { error: (error as Error).message });
-          log("verifier", `失败：${(error as Error).message}`);
+          const message = (error as Error).message;
+          // A sandbox that never started is not a defect in the problem.
+          if (isSandboxUnavailableError(message)) {
+            advance("verifier", "failed", {
+              summary: "验题沙箱不可用",
+              error: message,
+            });
+            log(
+              "verifier",
+              `验题沙箱不可用（Docker Desktop 未运行或已停止），这不是题目缺陷；` +
+                `跳过修复轮以免空烧模型调用。${message}`,
+            );
+          } else {
+            advance("verifier", "failed", { error: message });
+            log("verifier", `失败：${message}`);
+          }
           break;
         }
 
         if (verification.passed) {
+          break;
+        }
+
+        // Infrastructure failure: the sandbox never ran, so no source edit can
+        // fix it. Stop before the repair round instead of spending a model call
+        // on Docker being down. The verdict is UNKNOWN, not failed.
+        if (verification.infrastructure) {
+          log(
+            "verifier",
+            "验题沙箱不可用（Docker Desktop 未运行或已停止），本次结果不代表题目对错；" +
+              "跳过修复轮以免空烧模型调用，启动 Docker 后重新验题即可。",
+          );
           break;
         }
 
@@ -1883,6 +1910,19 @@ export async function runPipeline(
           advance("verifier", "done", {
             summary: `通过 ${verification.passedCases} 个测试点`,
           });
+        } else if (verification.infrastructure) {
+          // The sandbox never ran the problem: the verdict is unknown, not
+          // "failed", and saying "未通过" here would mislabel a Docker outage as
+          // a defect in the problem.
+          advance("verifier", "failed", {
+            summary: "验题沙箱不可用（题目结论未知）",
+            error:
+              verification.failures[0]?.message ?? "验题沙箱不可用（Docker 未运行）",
+          });
+          log(
+            "verifier",
+            `验题沙箱不可用，未获得题目结论。启动 Docker 后重新验题。日志：verify-logs/${verification.logPath ?? ""}`,
+          );
         } else {
           advance("verifier", "failed", {
             summary: `${verification.failures.length} 项失败`,

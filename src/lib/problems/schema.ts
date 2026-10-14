@@ -116,6 +116,15 @@ export const verificationSchema = z.object({
   failures: z
     .array(z.object({ scope: z.string(), message: z.string() }))
     .default([]),
+  /**
+   * True when the run failed for infrastructure reasons - the sandbox was
+   * unavailable (Docker Desktop not running, image missing) - rather than
+   * because the problem is wrong. The verdict is then UNKNOWN, not "failed":
+   * the problem was never actually exercised. Kept distinct so the repair loop
+   * skips it (no model call can fix Docker) and the recycle report does not
+   * present it as a fixable defect.
+   */
+  infrastructure: z.boolean().default(false),
 });
 
 export const problemMetaSchema = z.object({

@@ -32,7 +32,9 @@ export type RecycleStatus =
   | "passed"
   | "failed"
   | "unverified"
-  | "unparseable";
+  | "unparseable"
+  /** Verification never ran the problem because the sandbox was unavailable. */
+  | "infrastructure";
 
 export type RecycleEntry = {
   problemId: string;
@@ -51,20 +53,36 @@ export type RecycleReport = {
   /** Every non-passed problem, most actionable first. */
   entries: RecycleEntry[];
   /** Counts by status for the header. */
-  counts: { passed: number; failed: number; unverified: number; unparseable: number };
+  counts: {
+    passed: number;
+    failed: number;
+    unverified: number;
+    unparseable: number;
+    infrastructure: number;
+  };
 };
 
 /** Read a workspace's verification verdict, null when never verified. */
 async function readVerification(
   problemId: string,
-): Promise<{ passed: boolean; ranAt: string | null; firstError: string | null } | null> {
+): Promise<{
+  passed: boolean;
+  ranAt: string | null;
+  firstError: string | null;
+  infrastructure: boolean;
+} | null> {
   try {
     const raw = await fs.readFile(
       path.join(problemsDir, problemId, "meta.json"),
       "utf8",
     );
     const meta = JSON.parse(raw) as {
-      verification?: { passed?: boolean; ranAt?: string; failures?: { message?: string }[] } | null;
+      verification?: {
+        passed?: boolean;
+        ranAt?: string;
+        infrastructure?: boolean;
+        failures?: { message?: string }[];
+      } | null;
     };
     if (!meta.verification) {
       return null;
@@ -73,6 +91,7 @@ async function readVerification(
       passed: meta.verification.passed === true,
       ranAt: typeof meta.verification.ranAt === "string" ? meta.verification.ranAt : null,
       firstError: meta.verification.failures?.[0]?.message ?? null,
+      infrastructure: meta.verification.infrastructure === true,
     };
   } catch {
     return null;
@@ -103,7 +122,7 @@ async function readConfig(
  */
 export async function recycleReport(): Promise<RecycleReport> {
   const groups = await listProblems();
-  const counts = { passed: 0, failed: 0, unverified: 0, unparseable: 0 };
+  const counts = { passed: 0, failed: 0, unverified: 0, unparseable: 0, infrastructure: 0 };
   const entries: RecycleEntry[] = [];
 
   for (const group of groups) {
@@ -139,6 +158,22 @@ export async function recycleReport(): Promise<RecycleReport> {
         continue;
       }
 
+      // A sandbox outage is not a defect in the problem. It gets its own status
+      // and NO preflight: compiling a generator to hand someone a "repair
+      // ticket" for a Docker problem is exactly the misdiagnosis this avoids.
+      if (verification?.infrastructure) {
+        counts.infrastructure += 1;
+        entries.push({
+          problemId: entry.problemId,
+          status: "infrastructure",
+          lastError: verification.firstError,
+          lastVerifiedAt: verification.ranAt,
+          preflight: [],
+          hasTicket: false,
+        });
+        continue;
+      }
+
       const status: RecycleStatus = verification ? "failed" : "unverified";
       counts[status] += 1;
 
@@ -161,11 +196,13 @@ export async function recycleReport(): Promise<RecycleReport> {
   }
 
   // Most actionable first: problems with a preflight ticket, then failed,
-  // then never-verified.
+  // then never-verified, then sandbox outages (nothing to fix), then
+  // unparseable.
   const rank: Record<Exclude<RecycleStatus, "passed">, number> = {
     failed: 0,
     unverified: 1,
-    unparseable: 2,
+    infrastructure: 2,
+    unparseable: 3,
   };
   entries.sort((a, b) => {
     if (a.hasTicket !== b.hasTicket) return a.hasTicket ? -1 : 1;

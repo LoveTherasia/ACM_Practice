@@ -17,7 +17,7 @@ import { SpinnerGap, Wrench } from "@phosphor-icons/react";
 
 type RecycleEntry = {
   problemId: string;
-  status: "failed" | "unverified" | "unparseable";
+  status: "failed" | "unverified" | "unparseable" | "infrastructure";
   lastError: string | null;
   lastVerifiedAt: string | null;
   preflight: string[];
@@ -26,19 +26,27 @@ type RecycleEntry = {
 
 type RecycleReport = {
   entries: RecycleEntry[];
-  counts: { passed: number; failed: number; unverified: number; unparseable: number };
+  counts: {
+    passed: number;
+    failed: number;
+    unverified: number;
+    unparseable: number;
+    infrastructure: number;
+  };
 };
 
 const STATUS_LABEL: Record<RecycleEntry["status"], string> = {
   failed: "验题失败",
   unverified: "从未验题",
   unparseable: "无法解析",
+  infrastructure: "沙箱不可用（结论未知）",
 };
 
 const STATUS_CLASS: Record<RecycleEntry["status"], string> = {
   failed: "text-fail",
   unverified: "text-warn",
   unparseable: "text-subtle",
+  infrastructure: "text-subtle",
 };
 
 export default function RecyclePage() {
@@ -79,7 +87,7 @@ export default function RecyclePage() {
           </h1>
           <p className="mt-1 text-sm text-muted">
             {report
-              ? `共 ${report.counts.passed} 道通过、${report.entries.length} 道待回收（${report.counts.failed} 失败 / ${report.counts.unverified} 未验 / ${report.counts.unparseable} 不可解析）。带诊断的排前面。`
+              ? `共 ${report.counts.passed} 道通过、${report.entries.length} 道待回收（${report.counts.failed} 失败 / ${report.counts.unverified} 未验 / ${report.counts.infrastructure} 沙箱不可用 / ${report.counts.unparseable} 不可解析）。带诊断的排前面。`
               : "扫描全部工作区，为失败题目生成修复工单。"}
           </p>
         </div>
@@ -131,7 +139,9 @@ export default function RecyclePage() {
                 <span className={`text-xs font-medium ${STATUS_CLASS[entry.status]}`}>
                   {STATUS_LABEL[entry.status]}
                 </span>
-                {entry.hasTicket ? (
+                {entry.status === "infrastructure" ? (
+                  <span className="text-[10px] text-subtle">非题目问题（沙箱不可用）</span>
+                ) : entry.hasTicket ? (
                   <span className="rounded-full bg-accent/10 px-2 py-0.5 text-[10px] text-accent-text">
                     有修复工单（{entry.preflight.length} 项）
                   </span>
@@ -164,6 +174,12 @@ export default function RecyclePage() {
                         </pre>
                       ))}
                     </div>
+                  ) : entry.status === "infrastructure" ? (
+                    <p className="text-sm text-muted">
+                      上次验题因<strong>沙箱不可用</strong>中断（Docker Desktop
+                      未运行或已停止），本次结果不代表题目有问题——题目根本没有跑过。
+                      启动 Docker Desktop 后，用题目详情页的「重新验题」即可，无需修改任何文件。
+                    </p>
                   ) : (
                     <p className="text-sm text-muted">
                       预检（语言/格式/类型契约/样例同步/树检查/区分度）没有发现问题。

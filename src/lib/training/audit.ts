@@ -46,10 +46,42 @@ export type DatasetAudit = {
   malformed: { file: string; line: number; reason: string }[];
 };
 
+/**
+ * A sample whose prompt is a generic retro-capture placeholder.
+ *
+ * The "retro-captured" convention fills system/user with a fixed string that is
+ * identical for EVERY problem, so the real prompt is simply absent from the file.
+ */
+const PLACEHOLDER_USER = /^\(\s*retro-captured\b/i;
+
+export function isPlaceholderSample(sample: Pick<TrainingSample, "user">): boolean {
+  const user = (sample.user ?? "").trim();
+  return user === "" || PLACEHOLDER_USER.test(user);
+}
+
+/**
+ * Identity used for duplicate detection.
+ *
+ * A real sample is identified by (role, user): the same role given the same
+ * prompt is the same teaching signal, even across problems. A retro-captured
+ * placeholder has that same generic prompt for EVERY problem, so a (role, user)
+ * identity collapses them all into one group - and dedupeDataset, which keeps
+ * only the first occurrence, then deletes every later problem's verified data
+ * wholesale (observed: graph-graph-006.jsonl reduced from 3 samples to a 1-byte
+ * empty file). Namespacing a placeholder by its slug makes it a duplicate only
+ * of itself.
+ */
+function sampleIdentity(sample: Pick<TrainingSample, "slug" | "role" | "user">): string {
+  if (isPlaceholderSample(sample)) {
+    return `${sample.slug ?? ""}\u0000${sample.role}\u0000${sample.user}`;
+  }
+  return `${sample.role}\u0000${sample.user}`;
+}
+
 /** Hash a sample's identity: same role + same user prompt = same teaching signal. */
-function sampleHash(sample: Pick<TrainingSample, "role" | "user">): string {
+function sampleHash(sample: Pick<TrainingSample, "slug" | "role" | "user">): string {
   return createHash("sha256")
-    .update(`${sample.role}\u0000${sample.user}`)
+    .update(sampleIdentity(sample))
     .digest("hex")
     .slice(0, 16);
 }
@@ -160,11 +192,15 @@ export async function auditDataset(): Promise<DatasetAudit> {
     slug: sample.slug ?? "unknown",
     role: sample.role ?? "unknown",
     sh: shingles(sample.user ?? ""),
+    placeholder: isPlaceholderSample(sample),
   }));
   for (let i = 0; i < shingleCache.length; i += 1) {
     for (let j = i + 1; j < shingleCache.length; j += 1) {
       const a = shingleCache[i]!;
       const b = shingleCache[j]!;
+      // Placeholder prompts are identical by construction; comparing them only
+      // manufactures fake near-duplicates.
+      if (a.placeholder || b.placeholder) continue;
       if (a.role !== b.role || a.slug === b.slug) continue;
       const sim = jaccard(a.sh, b.sh);
       if (sim >= 0.8) {

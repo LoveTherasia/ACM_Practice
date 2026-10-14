@@ -123,13 +123,17 @@ export default async function ProblemPage({
           className={`mt-6 rounded-lg border px-5 py-4 text-sm ${
             meta.verification.passed
               ? "border-line bg-surface text-pass"
-              : "border-line bg-surface text-fail"
+              : meta.verification.infrastructure
+                ? "border-line bg-surface text-warn"
+                : "border-line bg-surface text-fail"
           }`}
         >
           <p className="font-medium">
             {meta.verification.passed
               ? `验题通过 · ${meta.verification.passedCases} 个测试点`
-              : `验题未通过 · ${meta.verification.failures.length} 项失败`}
+              : meta.verification.infrastructure
+                ? "未获得验题结论 · 沙箱不可用（Docker Desktop 未运行或已停止）"
+                : `验题未通过 · ${meta.verification.failures.length} 项失败`}
           </p>
           {meta.verification.failures.length > 0 ? (
             <ul className="mt-2 space-y-1">

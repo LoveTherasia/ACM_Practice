@@ -298,12 +298,99 @@ export function parseSupportedTypes(generatorSource: string): string[] | null {
 }
 
 /**
- * Compare the config's case types with the generator's declared types.
+ * Case types the generator actually dispatches on.
  *
- * Only runs when the generator declares a list, so an older workspace without
- * the marker is skipped rather than reported - a check that fires on every
- * legacy problem is one nobody reads.
+ * Every generator written for this pipeline branches on a literal
+ * `type == "name"` comparison, so those strings are a direct read of what the
+ * generator implements - and they are present even when the file carries no
+ * SUPPORTED_TYPES marker. That is the gap this closes: the scaffold template
+ * ships without a marker, so a marker-only check stayed silent on a config that
+ * planned 33 types against a generator that implemented the template's 5
+ * (graph-005, greedy-008), and the mismatch only surfaced after a full
+ * verification run as "Unknown case type" on every case.
  */
+const IMPLEMENTED_TYPE = /\btype\s*==\s*"([^"]+)"|"([^"]+)"\s*==\s*type\b/g;
+
+/** The set of case types named in literal `type == "..."` comparisons. */
+export function parseImplementedTypes(generatorSource: string): Set<string> {
+  const types = new Set<string>();
+  for (const match of generatorSource.matchAll(IMPLEMENTED_TYPE)) {
+    const name = (match[1] ?? match[2])?.trim();
+    if (name) {
+      types.add(name);
+    }
+  }
+  return types;
+}
+
+/**
+ * Compare the config's case types with what the generator can actually handle.
+ *
+ * The supported set is the union of the literal branches and the SUPPORTED_TYPES
+ * declaration: map/array dispatch has no literal comparison and is covered only
+ * by the marker, while the marker is frequently absent and the branches are the
+ * only evidence left. A generator with neither is left alone rather than guessed
+ * at - a check that fires on a shape it cannot read is one nobody reads.
+ */
+export function generatorTypeIssues(
+  generatorSource: string,
+  config: ProblemConfig,
+): string[] {
+  const configTypes = [...new Set(config.generator.cases.map((c) => c.type))].sort();
+  const declared = parseSupportedTypes(generatorSource);
+  const implemented = parseImplementedTypes(generatorSource);
+  const supported = new Set<string>([...implemented, ...(declared ?? [])]);
+
+  if (supported.size === 0) {
+    return [];
+  }
+
+  const problems: string[] = [];
+  const missing = configTypes.filter((type) => !supported.has(type));
+  if (missing.length > 0) {
+    problems.push(
+      [
+        "### generator 没有实现 config 里声明的全部 case type",
+        "```",
+        `config.json 声明的 type：${configTypes.join(", ")}`,
+        `generator 实际实现的分支：${
+          implemented.size > 0 ? [...implemented].sort().join(", ") : "(无字面分支)"
+        }`,
+        ...(declared ? [`generator 声明的 type：${declared.join(", ")}`] : []),
+        `缺失：${missing.join(", ")}`,
+        "```",
+        "这些 type 会落到 generator 的兜底分支：轻则 `Unknown case type` 让整轮验题失败，",
+        "重则**静默生成与名字无关的数据**——兜底数据本身合法，验题不会因此报错，",
+        "于是题面里承诺的边界/对抗数据实际上一个都不存在，数据强度远低于声称的水平。",
+        "",
+        "请二选一并保持两处一致：",
+        "- 在 `generator.cpp` 里为这些 type 补上真实的构造分支（按 coverage 意图实现），",
+        "  并在文件头用 `// SUPPORTED_TYPES: ...` 同步声明；",
+        "- 或者修正 `config.json` 的 case 清单，只保留 generator 真正实现的 type。",
+        "注意：不要为了消除报错而把 type 改成兜底分支的名字——那等于承认这些测试点没有强度。",
+      ].join("\n"),
+    );
+  }
+
+  // A declaration is only trustworthy when an unknown name cannot silently fall
+  // through to a default construction; require an explicit rejection path.
+  if (
+    declared &&
+    missing.length === 0 &&
+    !/(?:quitf\s*\(\s*_fail|Unknown\s+case\s+type|unknown\s+case)/i.test(generatorSource)
+  ) {
+    problems.push(
+      [
+        "### generator 声明了 SUPPORTED_TYPES，但没有显式拒绝未知 type",
+        "generator 必须在未知 case type 时调用 quitf(_fail, ...) 或明确报错退出，禁止静默兜底。",
+      ].join("\n"),
+    );
+  }
+
+  return problems;
+}
+
+/** Read the generator and report any case-type mismatch, as above. */
 export async function checkGeneratorTypes(
   problemId: string,
   config: ProblemConfig,
@@ -314,46 +401,7 @@ export async function checkGeneratorTypes(
   } catch {
     return [];
   }
-
-  const declared = parseSupportedTypes(source);
-  if (!declared) {
-    return [];
-  }
-  const supported = new Set(declared.map((type) => type.trim()));
-  const missing = [...new Set(config.generator.cases.map((c) => c.type))]
-    .filter((type) => !supported.has(type))
-    .sort();
-  if (missing.length === 0) {
-    // A declared list is only useful when unknown names cannot silently fall
-    // through to a default construction. Require an explicit rejection path;
-    // otherwise a future case typo can still produce valid but unintended data.
-    if (!/(?:quitf\s*\(\s*_fail|Unknown\s+case\s+type|unknown\s+case)/i.test(source)) {
-      return [
-        "### generator 声明了 SUPPORTED_TYPES，但没有显式拒绝未知 type",
-        "generator 必须在未知 case type 时调用 quitf(_fail, ...)，禁止使用静默兜底数据。",
-      ];
-    }
-    return [];
-  }
-
-  return [
-    "### generator 没有实现 config 里声明的全部 case type",
-    "```",
-    `config.json 声明的 type：${[...new Set(config.generator.cases.map((c) => c.type))].join(", ")}`,
-    `generator 声明支持的 type：${declared.join(", ")}`,
-    `缺失：${missing.join(", ")}`,
-    "```",
-    "这些 type 会落到 generator 的兜底分支，**静默生成与名字无关的数据**。",
-    "本题的验题**不会因此失败**（兜底数据本身合法），",
-    "所以问题不会被脚本发现——只是那些测试点名不副实，",
-    "题面里承诺的边界/对抗数据实际上一个都不存在，数据强度远低于声称的水平。",
-    "",
-    "请二选一并保持两处一致：",
-    "- 在 `generator.cpp` 里为这些 type 补上真实的构造分支（按 coverage 意图实现），",
-    "  并同步更新文件头的 `// SUPPORTED_TYPES: ...` 声明；",
-    "- 或者修正 `config.json` 的 case 清单，只保留 generator 真正实现的 type。",
-    "注意：不要为了消除报错而把 type 改成兜底分支的名字——那等于承认这些测试点没有强度。",
-  ];
+  return generatorTypeIssues(source, config);
 }
 
 /**
