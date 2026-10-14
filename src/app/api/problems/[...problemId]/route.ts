@@ -85,7 +85,9 @@ export async function POST(
   // a sub-route would never win the match against the greedy parent.
   const action = segments[segments.length - 1];
   const idSegments =
-    action === "submit" || action === "recheck" ? segments.slice(0, -1) : segments;
+    action === "submit" || action === "recheck" || action === "export-hydro"
+      ? segments.slice(0, -1)
+      : segments;
   if (idSegments.length !== 2) {
     return NextResponse.json(
       { error: `题目 id 应为 <分类>/<目录> 两级: ${segments.join("/")}` },
@@ -100,6 +102,10 @@ export async function POST(
 
   if (action === "recheck") {
     return handleRecheck(problemId);
+  }
+  if (action === "export-hydro") {
+    const { handleHydroExport } = await import("./export-hydro");
+    return handleHydroExport(request, problemId);
   }
 
   try {

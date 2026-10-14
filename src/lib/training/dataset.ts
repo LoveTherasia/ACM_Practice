@@ -1,7 +1,6 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 
-import { repoRoot } from "@/lib/settings/env-file";
 
 /**
  * Training dataset accumulation.
@@ -38,7 +37,9 @@ export type TrainingSample = {
 };
 
 export function datasetDir(): string {
-  return path.join(repoRoot, "training", "dataset");
+  // Resolved lazily (not from a frozen repoRoot) so tests can chdir into
+  // a scratch repo layout and audit a temporary dataset.
+  return path.join(process.cwd(), "training", "dataset");
 }
 
 /**

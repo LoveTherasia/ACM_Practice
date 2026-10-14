@@ -16,11 +16,14 @@ import {
 import {
   checkConfigParseable,
   checkDeclaredFormat,
+  checkInteractiveConfig,
   checkGeneratorTypes,
   checkStatementLanguage,
   checkWrongSolutionSubstance,
   describeFormatMismatch,
 } from "@/lib/problems/format";
+import { checkTreeData } from "@/lib/problems/tree-check";
+import { checkCaseDistinctness } from "@/lib/problems/case-distinctness";
 import {
   problemConfigSchema,
   type ProblemConfig,
@@ -620,6 +623,50 @@ export async function referenceRunner(
  * generator is shared by all cases, so one failure means all of them.
  */
 /**
+ * Compile the generator once and run it for a given (type, seed) inside the
+ * sandbox. Shared by the tree-data preflight; returns null when the compile
+ * fails so callers can skip silently (the compile preflight reports that).
+ */
+export async function sandboxedGeneratorRunner(
+  problemId: string,
+  config: ProblemConfig,
+): Promise<((type: string, seed: number) => Promise<{ code: number; stdout: string } | null>) | null> {
+  const source = problemPath(problemId, config.generator.path);
+  if (!(await exists(source))) {
+    return null;
+  }
+  return withSandboxScratch(async (scratch) => {
+    await fs.chmod(scratch, 0o777).catch(() => {});
+    const build = await runSandbox({
+      command: "g++",
+      args: ["-std=gnu++20", "-O2", "-I/problem/include", "/problem/generator.cpp", "-o", "/work/generator"],
+      mounts: [
+        { hostPath: scratch, containerPath: "/work" },
+        { hostPath: source, containerPath: "/problem/generator.cpp", readOnly: true },
+        { hostPath: problemPath(problemId, "include"), containerPath: "/problem/include", readOnly: true },
+      ],
+      timeoutMs: 90_000,
+      memoryMb: 1024,
+      maxOutputBytes: 4 * 1024 * 1024,
+    });
+    if (build.code !== 0) {
+      return null;
+    }
+    return async (type: string, seed: number) => {
+      const run = await runSandbox({
+        command: "/work/generator",
+        args: [type, String(seed)],
+        mounts: [{ hostPath: scratch, containerPath: "/work" }],
+        timeoutMs: 30_000,
+        memoryMb: 512,
+        maxOutputBytes: 16 * 1024 * 1024,
+      });
+      return run.code === 0 && !run.timedOut ? { code: run.code, stdout: run.stdout } : null;
+    };
+  });
+}
+
+/**
  * Compile every source file without producing a binary.
  *
  * Returns short, file-scoped diagnostics. Deliberately tolerant: a missing
@@ -642,6 +689,11 @@ export async function preflightCompile(
   // one makes every later check meaningless. It is also the only problem here
   // that can be reported without parsing the config at all.
   problems.push(...(await checkConfigParseable(problemId).catch(() => [])));
+  // Interactive problems must swap checker/interactor; a swapped config
+  // crashes the verifier with a cryptic PowerShell error.
+  problems.push(
+    ...(await checkInteractiveConfig(problemId, config).catch(() => [])),
+  );
 
   // Statement-versus-validator alignment first: a mismatch here means the two
   // documents describe different problems, and no other check can see it.
@@ -666,6 +718,38 @@ export async function preflightCompile(
   problems.push(
     ...(await checkGeneratorTypes(problemId, config).catch(() => [])),
   );
+
+  // When the problem is a tree problem (declared via the 树 tag, falling
+  // back to an explicit statement guarantee), every generator branch must
+  // really produce a tree. Cycles or disconnected data pass the validator
+  // (it only checks counts/ranges) and only surface later as undefined-
+  // solution behaviour.
+  {
+    let metaTags: string[] = [];
+    try {
+      const metaRaw = JSON.parse(
+        await fs.readFile(problemPath(problemId, "meta.json"), "utf8"),
+      ) as { tags?: unknown };
+      if (Array.isArray(metaRaw.tags)) {
+        metaTags = metaRaw.tags.filter((x): x is string => typeof x === "string");
+      }
+    } catch {
+      // No meta yet (first preflight): the statement fallback still applies.
+    }
+    const runGenerator = await sandboxedGeneratorRunner(problemId, config).catch(() => null);
+    if (runGenerator) {
+      problems.push(
+        ...(await checkTreeData(problemId, config, runGenerator, metaTags).catch(() => [])),
+      );
+      // Every case type must produce distinct data: a generator whose
+      // dispatch is broken (e.g. numeric atoi vs string types) makes all
+      // cases identical, verification passes vacuously, and the declared
+      // coverage does not exist.
+      problems.push(
+        ...(await checkCaseDistinctness(problemId, config, runGenerator).catch(() => [])),
+      );
+    }
+  }
 
   // The statement's own samples against the generated data. This is the only
   // mechanical link between the statement and the artefacts, and it is what

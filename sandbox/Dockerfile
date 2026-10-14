@@ -6,6 +6,10 @@ RUN apt-get update \
     && mkdir -p /work \
     && chown 65534:65534 /work
 
+# powershell-yaml for the Hydro zip export (export-hydrozip.ps1). Installed
+# into the all-users module path so the nobody user can import it.
+RUN pwsh -NoProfile -Command "Install-Module powershell-yaml -Scope AllUsers -Force -Repository PSGallery"
+
 USER 65534:65534
 WORKDIR /work
 

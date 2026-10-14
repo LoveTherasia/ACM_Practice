@@ -1,6 +1,7 @@
 "use client";
 
 import { Code, Dashboard, Home, Settings } from "@carbon/icons-react";
+import { Lightning, Wrench } from "@phosphor-icons/react";
 import {
   Content,
   Header,
@@ -30,6 +31,8 @@ import { ThemeToggle } from "@/components/theme-toggle";
 
 const REGISTRY_HREF = "/console";
 const GENERATE_HREF = "/console/generate";
+const BATCH_HREF = "/console/generate/batch";
+const RECYCLE_HREF = "/console/recycle";
 const SETTINGS_HREF = "/console/settings";
 
 export function ConsoleShell({ children }: { children: ReactNode }) {
@@ -42,6 +45,10 @@ export function ConsoleShell({ children }: { children: ReactNode }) {
     pathname === GENERATE_HREF || pathname.startsWith(`${GENERATE_HREF}/`);
   const settingsActive =
     pathname === SETTINGS_HREF || pathname.startsWith(`${SETTINGS_HREF}/`);
+  const recycleActive =
+    pathname === RECYCLE_HREF || pathname.startsWith(`${RECYCLE_HREF}/`);
+  const batchActive =
+    pathname === BATCH_HREF || pathname.startsWith(`${BATCH_HREF}/`);
 
   return (
     <>
@@ -66,6 +73,12 @@ export function ConsoleShell({ children }: { children: ReactNode }) {
           </HeaderMenuItem>
           <HeaderMenuItem href={SETTINGS_HREF} isActive={settingsActive}>
             模型配置
+          </HeaderMenuItem>
+          <HeaderMenuItem href={RECYCLE_HREF} isActive={recycleActive}>
+            回收站
+          </HeaderMenuItem>
+          <HeaderMenuItem href={BATCH_HREF} isActive={batchActive}>
+            批量造题
           </HeaderMenuItem>
         </HeaderNavigation>
         <HeaderGlobalBar>
@@ -102,6 +115,14 @@ export function ConsoleShell({ children }: { children: ReactNode }) {
               题目库
             </SideNavLink>
             <SideNavLink
+              href={BATCH_HREF}
+              isActive={batchActive}
+              renderIcon={Lightning}
+              onClick={() => setSideNavExpanded(false)}
+            >
+              批量造题
+            </SideNavLink>
+            <SideNavLink
               href={GENERATE_HREF}
               isActive={generateActive}
               renderIcon={Code}
@@ -116,6 +137,14 @@ export function ConsoleShell({ children }: { children: ReactNode }) {
               onClick={() => setSideNavExpanded(false)}
             >
               模型配置
+            </SideNavLink>
+            <SideNavLink
+              href={RECYCLE_HREF}
+              isActive={recycleActive}
+              renderIcon={Wrench}
+              onClick={() => setSideNavExpanded(false)}
+            >
+              回收站
             </SideNavLink>
           </HeaderSideNavItems>
         </SideNavItems>

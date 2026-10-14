@@ -8,6 +8,7 @@ import { RecheckPanel } from "./recheck-panel";
 import { SubmitPanel } from "./submit-panel";
 import { TutorialSection } from "./tutorial-section";
 import { VerifyButton } from "./verify-button";
+import { HydroExportButton } from "./hydro-export-button";
 
 /**
  * The problem detail page.
@@ -107,7 +108,13 @@ export default async function ProblemPage({
             ))}
           </div>
         </div>
-        <VerifyButton problemId={problemId} initial={meta.verification} />
+        <div className="flex items-start gap-3">
+          <VerifyButton problemId={problemId} initial={meta.verification} />
+          <HydroExportButton
+            problemId={problemId}
+            verified={meta.verification?.passed === true}
+          />
+        </div>
       </div>
 
       {/* Verification verdict */}

@@ -502,6 +502,53 @@ export async function checkConfigParseable(problemId: string): Promise<string[]>
   }
 }
 
+/**
+ * Interactive problems must point interactor at a file and leave checker
+ * null; non-interactive is the reverse.
+ *
+ * data-struct-006 shipped interactive=true with checker set and interactor
+ * null - the model swapped the two fields. The verifier's error was a
+ * cryptic "Cannot bind argument to parameter 'RelativePath' because it is
+ * an empty string" from deep inside the PowerShell config loader, which
+ * named neither the field nor the fix. This check reports the swap in one
+ * line before anything tries to run.
+ */
+export async function checkInteractiveConfig(
+  problemId: string,
+  config: ProblemConfig,
+): Promise<string[]> {
+  void problemId;
+  if (config.interactive) {
+    if (!config.interactor || typeof config.interactor !== "string") {
+      return [
+        [
+          "### 交互题的 config 字段交换了",
+          "```",
+          "interactive = true，但 interactor 为空、checker 已设置",
+          "```",
+          "交互题必须：checker = null，interactor = \"src/checker/interactor.cpp\"。",
+          "当前配置会让验题脚本在解析 config 时以一条晦涩的",
+          "「RelativePath 为空」错误崩溃，不会指向真正的原因。",
+          "请交换两个字段的值后重跑验题。",
+        ].join("\n"),
+      ];
+    }
+  } else {
+    if (!config.checker || typeof config.checker !== "string") {
+      return [
+        [
+          "### 非交互题缺少 checker",
+          "```",
+          "interactive = false，但 checker 为空",
+          "```",
+          "普通题必须：checker = \"src/checker/checker.cpp\"，interactor = null。",
+        ].join("\n"),
+      ];
+    }
+  }
+  return [];
+}
+
 /** A repair-facing diagnostic for a first-line mismatch. */
 export function describeFormatMismatch(mismatch: FormatMismatch): string {
   return [
