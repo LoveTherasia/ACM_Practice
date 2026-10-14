@@ -37,12 +37,13 @@ import {
   dropMissingSolutionEntries,
   type GeneratedFile,
   preflightCompile,
+  runPreflight,
   referenceRunner,
   verificationEnabled,
   verifyWorkspace,
   writeGeneratedFiles,
 } from "@/lib/problems/workspace";
-import { isSandboxUnavailableError } from "@/lib/sandbox/docker";
+import { isSandboxUnavailableError, sandboxStatus } from "@/lib/sandbox/docker";
 import { describeSampleSync, syncDeclaredSamples } from "@/lib/problems/samples";
 import { auditCoverage, summarizeCoverage } from "@/lib/problems/coverage";
 import { codeStylePromptBlock, styleSkillDir } from "@/lib/llm/style";
@@ -773,6 +774,22 @@ export async function runPipeline(
   }
   brief.difficulty = difficultySchema.parse(brief.difficulty);
 
+  // Refuse to start when the sandbox is unavailable and verification is on.
+  // A run makes five-plus large model calls before the verifier ever executes, so
+  // discovering a dead Docker at verification time wastes the whole run (and, if
+  // the verdict was mistaken for a fixable defect, four repair calls more).
+  // Checking here turns that into an immediate, explicit error that costs nothing.
+  if (verificationEnabled()) {
+    const status = await sandboxStatus();
+    if (!status.available) {
+      throw new Error(
+        "验题沙箱不可用，已拒绝开始出题（未消耗任何模型调用）。" +
+          "请启动 Docker Desktop 并运行 npm run sandbox:build 后重试。" +
+          `原始错误：${status.error ?? "(未知)"}`,
+      );
+    }
+  }
+
   // Allocate the next problem number inside the category BEFORE any LLM
   // call, so the workspace path is fixed for the whole run.
   const allocation = await allocateProblem(brief.category, brief.categoryLabel);
@@ -1435,14 +1452,20 @@ export async function runPipeline(
       // defects exhausts the round budget while fixing them one at a time.
       let compileDiagnostics: string[] = [];
       try {
-        compileDiagnostics = await preflightCompile(
-          problemId,
-          await readConfig(problemId),
-        );
+        const report = await runPreflight(problemId, await readConfig(problemId));
+        compileDiagnostics = report.problems;
         if (compileDiagnostics.length > 0) {
           log(
             "verifier",
             `编译预检发现 ${compileDiagnostics.length} 个文件无法编译，将一次性交给修复轮`,
+          );
+        }
+        // Surface checks that could not run: "passed" and "never looked" must not
+        // read the same in the transcript.
+        if (report.skipped.length > 0) {
+          log(
+            "verifier",
+            `预检有 ${report.skipped.length} 项未执行（${report.skipped.join("、")}）——这些方面本次没有得到验证。`,
           );
         }
       } catch (error) {

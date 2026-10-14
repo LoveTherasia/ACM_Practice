@@ -621,12 +621,23 @@ export async function referenceRunner(
   };
 }
 
+/** A compiled generator, callable as (type, seed) -> stdout. */
+export type GeneratorRunner = (
+  type: string,
+  seed: number,
+) => Promise<{ code: number; stdout: string } | null>;
+
+/** A compiled validator, callable with the input on stdin. */
+export type ValidatorRunner = (
+  input: string,
+) => Promise<{ code: number; stderr: string; timedOut: boolean } | null>;
+
 /** Build the generator in `scratch` and bind a runner to it. */
 async function bindGenerator(
   scratch: string,
   source: string,
   includeDir: string,
-): Promise<((type: string, seed: number) => Promise<{ code: number; stdout: string } | null>) | null> {
+): Promise<GeneratorRunner | null> {
   const build = await runSandbox({
     command: "g++",
     args: ["-std=gnu++20", "-O2", "-I/problem/include", "/problem/generator.cpp", "-o", "/work/generator"],
@@ -660,9 +671,7 @@ async function bindValidator(
   scratch: string,
   source: string,
   includeDir: string,
-): Promise<
-  ((input: string) => Promise<{ code: number; stderr: string; timedOut: boolean } | null>) | null
-> {
+): Promise<ValidatorRunner | null> {
   const build = await runSandbox({
     command: "g++",
     args: ["-std=gnu++20", "-O2", "-I/problem/include", "/problem/validator.cpp", "-o", "/work/validator"],
@@ -706,8 +715,8 @@ export async function withSandboxedGeneratorAndValidator<T>(
   problemId: string,
   config: ProblemConfig,
   task: (tools: {
-    runGenerator: ((type: string, seed: number) => Promise<{ code: number; stdout: string } | null>) | null;
-    runValidator: ((input: string) => Promise<{ code: number; stderr: string; timedOut: boolean } | null>) | null;
+    runGenerator: GeneratorRunner | null;
+    runValidator: ValidatorRunner | null;
   }) => Promise<T>,
 ): Promise<T> {
   return withSandboxScratch(async (scratch) => {
@@ -730,130 +739,41 @@ export async function withSandboxedGeneratorAndValidator<T>(
 }
 
 /**
- * Compile every source file without producing a binary.
+ * Preflight check outcomes: ran and found nothing, ran and found problems, or
+ * could not run at all.
  *
- * Returns short, file-scoped diagnostics. Deliberately tolerant: a missing
- * compiler or an unreadable config must not fail a generation, so any problem
- * with the preflight itself yields an empty list and the normal verification
- * run still decides the outcome.
+ * The "skipped" state is the point. Every check used to be wrapped in
+ * `.catch(() => [])`, so a check that silently did nothing was indistinguishable
+ * from one that passed - and a broken runner hid both tree-check and
+ * case-distinctness for a long time. Callers can now tell "green" from "never
+ * looked".
  */
-export async function preflightCompile(
+export type PreflightCheckStatus = "passed" | "failed" | "skipped";
+
+export type PreflightCheck = {
+  id: string;
+  title: string;
+  status: PreflightCheckStatus;
+  problems: string[];
+  /** Why the check could not run (only when status === "skipped"). */
+  reason?: string;
+};
+
+export type PreflightReport = {
+  checks: PreflightCheck[];
+  /** Every problem message, flattened (feeds the repair prompt). */
+  problems: string[];
+  /** Ids of checks that could not run. */
+  skipped: string[];
+};
+
+/** Compile every source file without producing a binary; short diagnostics. */
+async function compileDiagnostics(
   problemId: string,
   config: ProblemConfig,
+  includeDir: string,
 ): Promise<string[]> {
-  const includeDir = problemPath(problemId, "include");
-  if (!(await exists(path.join(includeDir, PREFLIGHT_HEADER)))) {
-    return [];
-  }
-
   const problems: string[] = [];
-
-  // config.json first: it is the file everything else depends on, and a broken
-  // one makes every later check meaningless. It is also the only problem here
-  // that can be reported without parsing the config at all.
-  problems.push(...(await checkConfigParseable(problemId).catch(() => [])));
-  // Interactive problems must swap checker/interactor; a swapped config
-  // crashes the verifier with a cryptic PowerShell error.
-  problems.push(
-    ...(await checkInteractiveConfig(problemId, config).catch(() => [])),
-  );
-
-  // Statement-versus-validator alignment first: a mismatch here means the two
-  // documents describe different problems, and no other check can see it.
-  const mismatch = await checkDeclaredFormat(problemId, config).catch(() => null);
-  if (mismatch) {
-    problems.push(describeFormatMismatch(mismatch));
-  }
-
-  // A "wrong" solution that never reads the input is a placeholder, not a probe:
-  // it fails on every input, so it cannot show the data defeats any mistake.
-  problems.push(
-    ...(await checkWrongSolutionSubstance(problemId, config).catch(() => [])),
-  );
-
-  // Chinese prose, and a statement that is not still the scaffold template.
-  problems.push(
-    ...(await checkStatementLanguage(problemId, config).catch(() => [])),
-  );
-
-  // Every declared case type must be one the generator actually implements,
-  // or it silently falls through to the default branch.
-  problems.push(
-    ...(await checkGeneratorTypes(problemId, config).catch(() => [])),
-  );
-
-  // When the problem is a tree problem (declared via the 树 tag, falling
-  // back to an explicit statement guarantee), every generator branch must
-  // really produce a tree. Cycles or disconnected data pass the validator
-  // (it only checks counts/ranges) and only surface later as undefined-
-  // solution behaviour.
-  {
-    let metaTags: string[] = [];
-    try {
-      const metaRaw = JSON.parse(
-        await fs.readFile(problemPath(problemId, "meta.json"), "utf8"),
-      ) as { tags?: unknown };
-      if (Array.isArray(metaRaw.tags)) {
-        metaTags = metaRaw.tags.filter((x): x is string => typeof x === "string");
-      }
-    } catch {
-      // No meta yet (first preflight): the statement fallback still applies.
-    }
-
-    // The generator and validator are compiled once and reused by all runtime
-    // checks below, so the block costs two compiles plus a container run per
-    // probe. A failure of the block itself (sandbox down) is swallowed - the
-    // compile preflight and the verifier report that with better context.
-    await withSandboxedGeneratorAndValidator(
-      problemId,
-      config,
-      async ({ runGenerator, runValidator }) => {
-        if (!runGenerator) {
-          return;
-        }
-        // When the problem is a tree problem (declared via the 树 tag, falling
-        // back to an explicit statement guarantee), every generator branch must
-        // really produce a tree. Cycles or disconnected data pass the validator
-        // (it only checks counts/ranges) and only surface later as undefined-
-        // solution behaviour.
-        problems.push(
-          ...(await checkTreeData(problemId, config, runGenerator, metaTags).catch(() => [])),
-        );
-        // Every case type must produce distinct data: a generator whose
-        // dispatch is broken (e.g. numeric atoi vs string types) makes all
-        // cases identical, verification passes vacuously, and the declared
-        // coverage does not exist.
-        problems.push(
-          ...(await checkCaseDistinctness(problemId, config, runGenerator).catch(() => [])),
-        );
-        // The validator must ACCEPT what the generator emits. This is the link
-        // the preflight used to skip: template-001's generator printed the edge
-        // "4 1" (u > v) while its validator requires u_i < v_i, so every
-        // sample/format check passed and the failure only appeared after a full
-        // verification run.
-        if (runValidator) {
-          problems.push(
-            ...(await checkValidatorAcceptsGenerator(
-              problemId,
-              config,
-              runGenerator,
-              runValidator,
-            ).catch(() => [])),
-          );
-        }
-      },
-    ).catch(() => {});
-  }
-
-  // The statement's own samples against the generated data. This is the only
-  // mechanical link between the statement and the artefacts, and it is what
-  // catches a problem whose solutions answer a different question than the one
-  // asked - the failure mode that mattered most, because self-consistency makes
-  // it invisible to every other check.
-  problems.push(
-    ...(await checkDeclaredSamples(problemId, config).catch(() => [])),
-  );
-
   for (const relative of preflightTargets(config)) {
     const absolute = problemPath(problemId, relative);
     if (!(await exists(absolute))) continue;
@@ -883,12 +803,179 @@ export async function preflightCompile(
       .join("\n");
     problems.push(`### ${relative}\n\`\`\`\n${detail || "(编译器未给出可读信息)"}\n\`\`\``);
   }
-
-  // Runtime smoke tests are deliberately left to verifyWorkspace, which runs
-  // the whole toolchain inside one isolated container. Never execute a
-  // generated binary in the host-side preflight.
-
   return problems;
+}
+
+/**
+ * Run the full preflight suite, recording each check's three-state outcome.
+ *
+ * Deliberately tolerant: a check that throws or cannot run is recorded as
+ * "skipped" rather than failing the generation, so the normal verification run
+ * still decides the outcome. Callers that only want the problem messages use
+ * preflightCompile(), which flattens this report.
+ */
+export async function runPreflight(
+  problemId: string,
+  config: ProblemConfig,
+): Promise<PreflightReport> {
+  const checks: PreflightCheck[] = [];
+
+  const add = async (
+    id: string,
+    title: string,
+    fn: () => Promise<string[]>,
+  ): Promise<void> => {
+    try {
+      const problems = await fn();
+      checks.push({
+        id,
+        title,
+        status: problems.length > 0 ? "failed" : "passed",
+        problems,
+      });
+    } catch (error) {
+      checks.push({
+        id,
+        title,
+        status: "skipped",
+        problems: [],
+        reason: (error as Error).message,
+      });
+    }
+  };
+
+  const includeDir = problemPath(problemId, "include");
+  if (!(await exists(path.join(includeDir, PREFLIGHT_HEADER)))) {
+    // Nothing compiles without testlib, and every runtime check needs a compiled
+    // binary. Report the suite as not-run rather than as a pass.
+    return {
+      checks: [
+        {
+          id: "compile",
+          title: "编译预检",
+          status: "skipped",
+          problems: [],
+          reason: "缺少 include/testlib.h，无法编译 generator/标程/checker",
+        },
+      ],
+      problems: [],
+      skipped: ["compile"],
+    };
+  }
+
+  // config.json first: it is the file everything else depends on, and a broken
+  // one makes every later check meaningless.
+  await add("config-parseable", "config.json 可解析", () =>
+    checkConfigParseable(problemId),
+  );
+  await add("interactive-config", "交互题 checker/interactor 字段", () =>
+    checkInteractiveConfig(problemId, config),
+  );
+  await add("declared-format", "题面与 validator 的行格式", async () => {
+    const mismatch = await checkDeclaredFormat(problemId, config);
+    return mismatch ? [describeFormatMismatch(mismatch)] : [];
+  });
+  await add("wrong-substance", "错解是否有实质内容", () =>
+    checkWrongSolutionSubstance(problemId, config),
+  );
+  await add("statement-language", "题面语言", () =>
+    checkStatementLanguage(problemId, config),
+  );
+  await add("generator-types", "generator 与 config 的 type 契约", () =>
+    checkGeneratorTypes(problemId, config),
+  );
+  // The statement's own samples against the generated data. This is the only
+  // mechanical link between the statement and the artefacts, and it is what
+  // catches a problem whose solutions answer a different question than the one
+  // asked - the failure mode that mattered most, because self-consistency makes
+  // it invisible to every other check.
+  await add("declared-samples", "题面样例与生成数据一致", () =>
+    checkDeclaredSamples(problemId, config),
+  );
+
+  // Runtime checks need the sandbox. The generator and validator are compiled
+  // once and reused; the scratch outlives the runners (see
+  // withSandboxedGeneratorAndValidator). If the tools cannot be built, the
+  // runtime checks are recorded as skipped rather than passed.
+  let metaTags: string[] = [];
+  try {
+    const metaRaw = JSON.parse(
+      await fs.readFile(problemPath(problemId, "meta.json"), "utf8"),
+    ) as { tags?: unknown };
+    if (Array.isArray(metaRaw.tags)) {
+      metaTags = metaRaw.tags.filter((x): x is string => typeof x === "string");
+    }
+  } catch {
+    // No meta yet (first preflight): the statement fallback still applies.
+  }
+
+  let runGenerator: GeneratorRunner | null = null;
+  let runValidator: ValidatorRunner | null = null;
+  let toolError: string | null = null;
+  try {
+    await withSandboxedGeneratorAndValidator(
+      problemId,
+      config,
+      async ({ runGenerator: gen, runValidator: val }) => {
+        runGenerator = gen;
+        runValidator = val;
+        if (gen) {
+          await add("tree-data", "树题数据合法性", () =>
+            checkTreeData(problemId, config, gen, metaTags),
+          );
+          await add("case-distinctness", "case 数据互异性", () =>
+            checkCaseDistinctness(problemId, config, gen),
+          );
+        }
+        if (gen && val) {
+          await add("validator-accepts", "validator 接受 generator 的输出", () =>
+            checkValidatorAcceptsGenerator(problemId, config, gen, val),
+          );
+        }
+      },
+    );
+  } catch (error) {
+    toolError = (error as Error).message;
+  }
+
+  if (!runGenerator) {
+    checks.push({
+      id: "runtime",
+      title: "运行时检查（树/区分度/validator）",
+      status: "skipped",
+      problems: [],
+      reason: toolError ?? "generator 无法编译或缺失，运行时检查未执行",
+    });
+  } else if (!runValidator) {
+    checks.push({
+      id: "validator-accepts",
+      title: "validator 接受 generator 的输出",
+      status: "skipped",
+      problems: [],
+      reason: "validator 无法编译或缺失，未执行",
+    });
+  }
+
+  // Compile diagnostics last: the slowest and least specific.
+  await add("compile", "逐文件编译", () =>
+    compileDiagnostics(problemId, config, includeDir),
+  );
+
+  const problems = checks.flatMap((c) => c.problems);
+  const skipped = checks.filter((c) => c.status === "skipped").map((c) => c.id);
+  return { checks, problems, skipped };
+}
+
+/**
+ * Compile every source file without producing a binary, returning short
+ * file-scoped diagnostics. Thin wrapper over runPreflight for callers that only
+ * want the problem messages (the repair prompt, the recycle ticket).
+ */
+export async function preflightCompile(
+  problemId: string,
+  config: ProblemConfig,
+): Promise<string[]> {
+  return (await runPreflight(problemId, config)).problems;
 }
 
 /**

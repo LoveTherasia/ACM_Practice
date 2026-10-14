@@ -44,19 +44,39 @@ export type DatasetAudit = {
   };
   /** Samples whose fields are malformed (empty prompts, bad JSON). */
   malformed: { file: string; line: number; reason: string }[];
+  /**
+   * Samples with no real prompt (retro-capture placeholders). They carry no
+   * usable (prompt -> reply) signal and should be pruned before fine-tuning.
+   */
+  placeholders: { count: number };
 };
 
 /**
- * A sample whose prompt is a generic retro-capture placeholder.
+ * The generic retro-capture placeholder.
  *
  * The "retro-captured" convention fills system/user with a fixed string that is
  * identical for EVERY problem, so the real prompt is simply absent from the file.
+ * A sample built on it teaches the model to answer a placeholder, not the task.
  */
-const PLACEHOLDER_USER = /^\(\s*retro-captured\b/i;
+const PLACEHOLDER_TEXT = /^\(\s*retro-captured\b/i;
 
-export function isPlaceholderSample(sample: Pick<TrainingSample, "user">): boolean {
-  const user = (sample.user ?? "").trim();
-  return user === "" || PLACEHOLDER_USER.test(user);
+/** Whether a single prompt field is the retro-capture placeholder. */
+export function isPlaceholderText(text: string | null | undefined): boolean {
+  return PLACEHOLDER_TEXT.test((text ?? "").trim());
+}
+
+/**
+ * A sample with no real prompt: an empty user, or the retro-capture placeholder
+ * standing in for either field.
+ */
+export function isPlaceholderSample(
+  sample: Partial<Pick<TrainingSample, "system" | "user">>,
+): boolean {
+  return (
+    (sample.user ?? "").trim() === "" ||
+    isPlaceholderText(sample.user) ||
+    isPlaceholderText(sample.system)
+  );
 }
 
 /**
@@ -71,7 +91,9 @@ export function isPlaceholderSample(sample: Pick<TrainingSample, "user">): boole
  * empty file). Namespacing a placeholder by its slug makes it a duplicate only
  * of itself.
  */
-function sampleIdentity(sample: Pick<TrainingSample, "slug" | "role" | "user">): string {
+function sampleIdentity(
+  sample: Pick<TrainingSample, "slug" | "role" | "user" | "system">,
+): string {
   if (isPlaceholderSample(sample)) {
     return `${sample.slug ?? ""}\u0000${sample.role}\u0000${sample.user}`;
   }
@@ -79,7 +101,9 @@ function sampleIdentity(sample: Pick<TrainingSample, "slug" | "role" | "user">):
 }
 
 /** Hash a sample's identity: same role + same user prompt = same teaching signal. */
-function sampleHash(sample: Pick<TrainingSample, "slug" | "role" | "user">): string {
+function sampleHash(
+  sample: Pick<TrainingSample, "slug" | "role" | "user" | "system">,
+): string {
   return createHash("sha256")
     .update(sampleIdentity(sample))
     .digest("hex")
@@ -243,6 +267,9 @@ export async function auditDataset(): Promise<DatasetAudit> {
     nearDuplicates: { count: nearPairs.length, pairs: nearPairs.slice(0, 20) },
     distribution: { categories, roles },
     malformed,
+    placeholders: {
+      count: all.filter((s) => isPlaceholderSample(s.sample)).length,
+    },
   };
 }
 
@@ -290,4 +317,56 @@ export async function dedupeDataset(): Promise<{ removed: number }> {
     await fs.writeFile(file, `${kept.join("\n").replace(/\n+$/, "")}\n`, "utf8");
   }
   return { removed };
+}
+
+/**
+ * Remove samples that carry no real prompt.
+ *
+ * A retro-captured placeholder ("(retro-captured: user brief for …)") is the
+ * same string for every problem, so a sample built on it teaches the model to
+ * answer a placeholder rather than the task - the assistant half may be real,
+ * but the (prompt -> reply) pair the model learns from is not. Rewrites the
+ * jsonl files in place and reports what was removed per file.
+ */
+export async function prunePlaceholderSamples(): Promise<{
+  removed: number;
+  files: { file: string; removed: number }[];
+}> {
+  const entries = await fs.readdir(datasetDir(), { withFileTypes: true }).catch(() => []);
+  const files = entries
+    .filter((e) => e.isFile() && e.name.endsWith(".jsonl"))
+    .map((e) => e.name)
+    .sort();
+
+  const report: { file: string; removed: number }[] = [];
+  let total = 0;
+  for (const name of files) {
+    const file = path.join(datasetDir(), name);
+    const raw = await fs.readFile(file, "utf8").catch(() => "");
+    const kept: string[] = [];
+    let removed = 0;
+    for (const line of raw.split("\n")) {
+      const cleaned = line.replace(/^\uFEFF/, "");
+      if (!cleaned.trim()) {
+        if (line !== "") kept.push(line);
+        continue;
+      }
+      try {
+        const sample = JSON.parse(cleaned) as TrainingSample;
+        if (isPlaceholderSample(sample)) {
+          removed += 1;
+          continue;
+        }
+        kept.push(cleaned);
+      } catch {
+        kept.push(cleaned); // Malformed lines are the audit's business.
+      }
+    }
+    if (removed > 0) {
+      await fs.writeFile(file, `${kept.join("\n").replace(/\n+$/, "")}\n`, "utf8");
+      report.push({ file: name, removed });
+      total += removed;
+    }
+  }
+  return { removed: total, files: report };
 }

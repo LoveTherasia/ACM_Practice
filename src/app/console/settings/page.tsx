@@ -24,6 +24,37 @@ type TrainingStats = {
   advice: string;
 };
 
+type EvalSample = {
+  slug: string;
+  role: string;
+  answered: boolean;
+  parseOk: boolean;
+  fileSetMatch: boolean;
+  missing: string[];
+  extra: string[];
+  similarity: number;
+  error: string | null;
+};
+
+type EvalReport = {
+  model: string;
+  total: number;
+  evaluated: number;
+  answeredRate: number;
+  parseRate: number;
+  fileSetMatchRate: number;
+  meanSimilarity: number;
+  elapsedMs: number;
+  byRole: {
+    role: string;
+    n: number;
+    parseRate: number;
+    fileSetMatchRate: number;
+    meanSimilarity: number;
+  }[];
+  samples: EvalSample[];
+};
+
 type SandboxStatus = {
   available: boolean;
   image: string;
@@ -164,6 +195,10 @@ export default function SettingsPage() {
   const [messageKind, setMessageKind] = useState<"ok" | "err">("ok");
   const [training, setTraining] = useState<TrainingStats | null>(null);
   const [sandbox, setSandbox] = useState<SandboxStatus | null>(null);
+  const [evaluating, setEvaluating] = useState(false);
+  const [evalReport, setEvalReport] = useState<EvalReport | null>(null);
+  const [evalError, setEvalError] = useState<string | null>(null);
+  const [evalLimit, setEvalLimit] = useState("20");
 
   const notify = (kind: "ok" | "err", text: string) => {
     setMessageKind(kind);
@@ -331,6 +366,30 @@ export default function SettingsPage() {
       notify("err", (e as Error).message);
     } finally {
       setTesting(false);
+    }
+  };
+
+  const runEval = async () => {
+    setEvaluating(true);
+    setEvalError(null);
+    setEvalReport(null);
+    try {
+      const limit = Number.parseInt(evalLimit, 10);
+      const response = await fetch("/api/settings/training/evaluate", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(Number.isFinite(limit) && limit > 0 ? { limit } : {}),
+      });
+      const payload = (await response.json()) as EvalReport | { error?: string };
+      if (!response.ok) {
+        setEvalError((payload as { error?: string }).error ?? `HTTP ${response.status}`);
+        return;
+      }
+      setEvalReport(payload as EvalReport);
+    } catch (e) {
+      setEvalError((e as Error).message);
+    } finally {
+      setEvaluating(false);
     }
   };
 
@@ -710,6 +769,122 @@ export default function SettingsPage() {
             </li>
           </ol>
         </details>
+
+        <div className="mt-6 rounded-md border border-line bg-surface px-4 py-4">
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <p className="text-sm font-medium text-ink">评估当前模型</p>
+              <p className="mt-1 max-w-[60ch] text-xs leading-relaxed text-muted">
+                用数据集里的真实 (system, user) 提示重放当前配置的模型，统计它是否遵循
+                文件协议、是否产出与标注一致的文件集合。微调落地后用它判断模型是否真的变好。
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              <label htmlFor="evalLimit" className="text-xs text-subtle">
+                样本数
+              </label>
+              <input
+                id="evalLimit"
+                value={evalLimit}
+                onChange={(e) => setEvalLimit(e.target.value)}
+                inputMode="numeric"
+                className="w-20 rounded-md border border-line-strong bg-raised px-2 py-1.5 font-mono text-xs text-ink focus-ring"
+              />
+              <button
+                type="button"
+                onClick={runEval}
+                disabled={evaluating}
+                className="inline-flex items-center gap-2 rounded-md border border-line-strong px-4 py-2 text-xs font-medium text-ink transition-colors duration-300 hover:bg-inset disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {evaluating ? "评估中…（每条一次模型调用）" : "开始评估"}
+              </button>
+            </div>
+          </div>
+
+          {evalError ? (
+            <p
+              role="alert"
+              className="mt-3 rounded-md border border-fail/30 bg-fail/10 px-3 py-2 text-xs text-fail"
+            >
+              {evalError}
+            </p>
+          ) : null}
+
+          {evalReport ? (
+            <div className="mt-4">
+              <div className="grid gap-px overflow-hidden rounded-md border border-line bg-line sm:grid-cols-4">
+                {[
+                  ["模型", evalReport.model],
+                  ["样本", `${evalReport.evaluated}/${evalReport.total}`],
+                  ["文件协议遵循率", `${Math.round(evalReport.parseRate * 100)}%`],
+                  ["文件集合一致率", `${Math.round(evalReport.fileSetMatchRate * 100)}%`],
+                ].map(([label, value]) => (
+                  <div key={label} className="bg-surface px-4 py-3">
+                    <p className="text-[11px] text-subtle">{label}</p>
+                    <p
+                      className="mt-1 truncate font-mono text-sm text-ink"
+                      title={String(value)}
+                    >
+                      {value}
+                    </p>
+                  </div>
+                ))}
+              </div>
+              <p className="mt-2 text-xs text-subtle">
+                平均文本相似度 {Math.round(evalReport.meanSimilarity * 100)}% · 用时{" "}
+                {(evalReport.elapsedMs / 1000).toFixed(1)}s
+              </p>
+
+              {evalReport.byRole.length > 0 ? (
+                <div className="mt-3 overflow-x-auto">
+                  <table className="w-full text-left text-xs">
+                    <thead className="text-subtle">
+                      <tr>
+                        <th className="py-1 pr-4 font-medium">角色</th>
+                        <th className="py-1 pr-4 font-medium">样本</th>
+                        <th className="py-1 pr-4 font-medium">协议遵循</th>
+                        <th className="py-1 pr-4 font-medium">文件一致</th>
+                        <th className="py-1 font-medium">相似度</th>
+                      </tr>
+                    </thead>
+                    <tbody className="font-mono text-muted">
+                      {evalReport.byRole.map((r) => (
+                        <tr key={r.role} className="border-t border-line">
+                          <td className="py-1 pr-4 text-ink">{r.role}</td>
+                          <td className="py-1 pr-4">{r.n}</td>
+                          <td className="py-1 pr-4">{Math.round(r.parseRate * 100)}%</td>
+                          <td className="py-1 pr-4">{Math.round(r.fileSetMatchRate * 100)}%</td>
+                          <td className="py-1">{Math.round(r.meanSimilarity * 100)}%</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ) : null}
+
+              {evalReport.samples.some((s) => s.error || !s.fileSetMatch) ? (
+                <ul className="mt-3 space-y-1">
+                  {evalReport.samples
+                    .filter((s) => s.error || !s.fileSetMatch)
+                    .slice(0, 8)
+                    .map((s) => (
+                      <li
+                        key={`${s.slug}-${s.role}`}
+                        className="font-mono text-[11px] leading-5 text-muted"
+                      >
+                        [{s.role}] {s.slug}：
+                        {s.error
+                          ? `调用失败（${s.error}）`
+                          : s.missing.length
+                            ? `缺少 ${s.missing.join("、")}`
+                            : `多出 ${s.extra.join("、")}`}
+                      </li>
+                    ))}
+                </ul>
+              ) : null}
+            </div>
+          ) : null}
+        </div>
       </section>
     </div>
   );

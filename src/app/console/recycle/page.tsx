@@ -21,6 +21,13 @@ type RecycleEntry = {
   lastError: string | null;
   lastVerifiedAt: string | null;
   preflight: string[];
+  checks: {
+    id: string;
+    title: string;
+    status: "passed" | "failed" | "skipped";
+    problems: string[];
+    reason?: string;
+  }[];
   hasTicket: boolean;
 };
 
@@ -148,6 +155,11 @@ export default function RecyclePage() {
                 ) : (
                   <span className="text-[10px] text-subtle">预检未发现问题（需人工排查）</span>
                 )}
+                {entry.checks.some((c) => c.status === "skipped") ? (
+                  <span className="rounded-full bg-warn/10 px-2 py-0.5 text-[10px] text-warn">
+                    {entry.checks.filter((c) => c.status === "skipped").length} 项检查未执行
+                  </span>
+                ) : null}
                 <span className="ml-auto text-xs text-subtle">
                   {entry.lastVerifiedAt
                     ? `上次验题 ${new Date(entry.lastVerifiedAt).toLocaleString("zh-CN")}`
@@ -163,6 +175,34 @@ export default function RecyclePage() {
 
               {open === entry.problemId ? (
                 <div className="border-t border-line px-5 py-4">
+                  {entry.checks.length > 0 ? (
+                    <ul className="mb-4 grid gap-1 sm:grid-cols-2">
+                      {entry.checks.map((check) => (
+                        <li key={check.id} className="flex items-start gap-2 text-xs">
+                          <span
+                            className={`shrink-0 font-medium ${
+                              check.status === "failed"
+                                ? "text-fail"
+                                : check.status === "skipped"
+                                  ? "text-warn"
+                                  : "text-pass"
+                            }`}
+                          >
+                            {check.status === "failed"
+                              ? "未通过"
+                              : check.status === "skipped"
+                                ? "未执行"
+                                : "通过"}
+                          </span>
+                          <span className="text-ink">{check.title}</span>
+                          {check.status === "skipped" && check.reason ? (
+                            <span className="text-subtle">— {check.reason}</span>
+                          ) : null}
+                        </li>
+                      ))}
+                    </ul>
+                  ) : null}
+
                   {entry.preflight.length > 0 ? (
                     <div className="space-y-4">
                       {entry.preflight.map((ticket, i) => (

@@ -3,7 +3,7 @@ import path from "node:path";
 
 import { problemsDir } from "@/lib/paths";
 import { listProblems } from "@/lib/problems/store";
-import { preflightCompile } from "@/lib/problems/workspace";
+import { runPreflight, type PreflightCheck } from "@/lib/problems/workspace";
 import {
   problemConfigSchema,
   type ProblemConfig,
@@ -45,6 +45,8 @@ export type RecycleEntry = {
   lastVerifiedAt: string | null;
   /** Preflight diagnostics (the repair ticket), for non-passed problems. */
   preflight: string[];
+  /** Per-check three-state outcome (passed / failed / skipped). */
+  checks: PreflightCheck[];
   /** True when the preflight found something actionable. */
   hasTicket: boolean;
 };
@@ -143,6 +145,7 @@ export async function recycleReport(): Promise<RecycleReport> {
             "常见原因是模型回复被截断，写进去的 JSON 只写了一半。",
             "建议删除该工作区重新生成。",
           ],
+          checks: [],
           hasTicket: true,
         });
         continue;
@@ -169,6 +172,7 @@ export async function recycleReport(): Promise<RecycleReport> {
           lastError: verification.firstError,
           lastVerifiedAt: verification.ranAt,
           preflight: [],
+          checks: [],
           hasTicket: false,
         });
         continue;
@@ -179,10 +183,10 @@ export async function recycleReport(): Promise<RecycleReport> {
 
       // The repair ticket: run the preflight suite on this workspace.
       const config = await readConfig(entry.problemId);
-      let preflight: string[] = [];
-      if (config) {
-        preflight = await preflightCompile(entry.problemId, config).catch(() => []);
-      }
+      const report = config
+        ? await runPreflight(entry.problemId, config).catch(() => null)
+        : null;
+      const preflight = report?.problems ?? [];
 
       entries.push({
         problemId: entry.problemId,
@@ -190,6 +194,7 @@ export async function recycleReport(): Promise<RecycleReport> {
         lastError: verification?.firstError ?? null,
         lastVerifiedAt: verification?.ranAt ?? null,
         preflight,
+        checks: report?.checks ?? [],
         hasTicket: preflight.length > 0,
       });
     }

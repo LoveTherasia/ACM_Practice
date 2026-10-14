@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { auditDataset, dedupeDataset } from "./audit";
+import { auditDataset, dedupeDataset, prunePlaceholderSamples } from "./audit";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -179,6 +179,57 @@ describe("dedupeDataset", () => {
         expect(result.removed).toBe(1);
         const raw = await fs.readFile(path.join(dir, "training", "dataset", "test.jsonl"), "utf8");
         expect(raw.trim().split("\n")).toHaveLength(1);
+      },
+    );
+  });
+});
+
+describe("placeholder samples", () => {
+  it("reports them in the audit", async () => {
+    await withScratchDataset(
+      [
+        sample({ slug: "a-a-001" }),
+        sample({
+          slug: "b-b-001",
+          role: "judge-validator",
+          system: "(retro-captured: system prompt for judge-validator)",
+          user: "(retro-captured: user brief for judge-validator)",
+        }),
+      ],
+      async () => {
+        const report = await auditDataset();
+        expect(report.samples).toBe(2);
+        expect(report.placeholders.count).toBe(1);
+      },
+    );
+  });
+
+  it("prunes them and keeps real samples", async () => {
+    await withScratchDataset(
+      [
+        sample({ slug: "a-a-001", assistant: "real" }),
+        sample({
+          slug: "b-b-001",
+          role: "judge-validator",
+          user: "(retro-captured: user brief for judge-validator)",
+          assistant: "placeholder",
+        }),
+        sample({
+          slug: "c-c-001",
+          role: "architect",
+          system: "(retro-captured: system prompt for architect)",
+          user: "real user",
+          assistant: "x",
+        }),
+      ],
+      async (dir) => {
+        const result = await prunePlaceholderSamples();
+        expect(result.removed).toBe(2);
+        expect(result.files).toEqual([{ file: "test.jsonl", removed: 2 }]);
+        const raw = await fs.readFile(path.join(dir, "training", "dataset", "test.jsonl"), "utf8");
+        const lines = raw.trim().split("\n").map((l) => JSON.parse(l));
+        expect(lines).toHaveLength(1);
+        expect(lines[0]?.assistant).toBe("real");
       },
     );
   });

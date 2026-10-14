@@ -27,7 +27,9 @@ export async function GET() {
   }
 }
 
-const actionSchema = z.object({ action: z.literal("dedupe") });
+const actionSchema = z.object({
+  action: z.enum(["dedupe", "prune-placeholders"]),
+});
 
 export async function POST(request: Request) {
   let body: unknown;
@@ -39,18 +41,23 @@ export async function POST(request: Request) {
   const parsed = actionSchema.safeParse(body);
   if (!parsed.success) {
     return NextResponse.json(
-      { error: "仅支持 {\"action\": \"dedupe\"}" },
+      { error: "仅支持 {\"action\": \"dedupe\"} 或 {\"action\": \"prune-placeholders\"}" },
       { status: 400 },
     );
   }
 
   try {
+    if (parsed.data.action === "prune-placeholders") {
+      const { prunePlaceholderSamples } = await import("@/lib/training/audit");
+      const result = await prunePlaceholderSamples();
+      return NextResponse.json(result);
+    }
     const { dedupeDataset } = await import("@/lib/training/audit");
     const result = await dedupeDataset();
     return NextResponse.json(result);
   } catch (error) {
     return NextResponse.json(
-      { error: `去重失败：${(error as Error).message}` },
+      { error: `操作失败：${(error as Error).message}` },
       { status: 500 },
     );
   }
